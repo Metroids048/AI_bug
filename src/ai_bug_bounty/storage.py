@@ -14,6 +14,7 @@ from .domain import (
     PlatformResult,
     PlatformResultStatus,
     Program,
+    ProgramPolicySnapshot,
     ProgramState,
     _jsonable,
     now_utc,
@@ -85,12 +86,23 @@ class Repository:
         self.connection.close()
 
     def save(self, entity_type: str, model: T, program_id: str | None = None, event_type: str = "ENTITY_SAVED") -> T:
+        revoked_program: Program | None = None
         if entity_type == "program":
             existing = self.get("program", model.id, Program)
             if existing and existing.scope_hash() != model.scope_hash():
                 model.state = ProgramState.REVIEW_REQUIRED
                 model.authorization_hash = None
                 model.authorized_at = None
+        elif entity_type == "policy_snapshot":
+            existing = self.get("policy_snapshot", model.id, ProgramPolicySnapshot)
+            if existing and existing.content_hash() != model.content_hash():
+                revoked_program = self.get("program", model.program_id, Program)
+                model.human_confirmed = False
+                if revoked_program:
+                    revoked_program.state = ProgramState.REVIEW_REQUIRED
+                    revoked_program.authorization_hash = None
+                    revoked_program.authorized_at = None
+                    revoked_program.updated_at = now_utc()
         payload = _jsonable(model)
         state = payload.get("state") if isinstance(payload, dict) else None
         created_at = payload.get("created_at", now_utc().isoformat())
@@ -105,6 +117,26 @@ class Repository:
                 (entity_type, model.id, program_id, state, json.dumps(payload, sort_keys=True), created_at, updated_at),
             )
             self._audit_in_transaction(conn, event_type, entity_type, model.id, {"state": state})
+            if revoked_program:
+                revoked_payload = _jsonable(revoked_program)
+                revoked_state = revoked_payload.get("state")
+                revoked_created = revoked_payload.get("created_at", now_utc().isoformat())
+                revoked_updated = revoked_payload.get("updated_at", revoked_created)
+                conn.execute(
+                    """INSERT INTO entities(entity_type, entity_id, program_id, state, payload_json, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                       program_id=excluded.program_id, state=excluded.state, payload_json=excluded.payload_json,
+                       updated_at=excluded.updated_at""",
+                    (
+                        "program", revoked_program.id, revoked_program.id, revoked_state,
+                        json.dumps(revoked_payload, sort_keys=True), revoked_created, revoked_updated,
+                    ),
+                )
+                self._audit_in_transaction(
+                    conn, "PROGRAM_AUTHORIZATION_REVOKED", "program", revoked_program.id,
+                    {"reason": "POLICY_SNAPSHOT_CHANGED", "state": revoked_state},
+                )
         return model
 
     def get(self, entity_type: str, entity_id: str, model_type: type[T]) -> T | None:

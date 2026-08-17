@@ -107,6 +107,9 @@ def test_policy_snapshot_content_tampering_is_denied(repo):
     assert snapshot is not None
     snapshot.raw_policy += "\nTAMPERED"
     repo.save("policy_snapshot", snapshot, authorized_program.id, "POLICY_SNAPSHOT_TAMPERED")
+    reloaded = repo.get_program(authorized_program.id)
+    assert reloaded.state == ProgramState.REVIEW_REQUIRED
+    assert reloaded.authorization_hash is None
     decision = ScopeGuard(repo).evaluate(proposal(authorized_program.id))
     assert decision.decision == Decision.DENY
     assert decision.reason_code == "PROGRAM_NOT_AUTHORIZED"
