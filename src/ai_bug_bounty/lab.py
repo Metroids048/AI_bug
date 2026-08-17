@@ -62,8 +62,8 @@ def create_benchmark_lab() -> FastAPI:
             raise HTTPException(status_code=404, detail="document not found")
         return {"id": document_id, "owner_id": "alice", "owner_email": "alice@example.test", "private_note": "benchmark private note", "viewer": user}
 
-    @app.get("/api/secure-documents/{document_id}")
-    async def secure_idor(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.get("/api/items/{document_id}")
+    async def item_document(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         user = require_user(x_lab_user)
         if document_id != "doc-a":
             raise HTTPException(status_code=404, detail="document not found")
@@ -71,45 +71,45 @@ def create_benchmark_lab() -> FastAPI:
             raise HTTPException(status_code=403, detail="forbidden")
         return {"id": document_id, "owner_id": "alice", "private_note": "benchmark private note", "viewer": user}
 
-    @app.get("/api/public-profiles/{user_id}")
-    async def public_profile(user_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.get("/api/users/{user_id}")
+    async def user_profile(user_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         require_user(x_lab_user)
         if user_id not in {"alice", "bob"}:
             raise HTTPException(status_code=404, detail="profile not found")
         return {"user_id": user_id, "display_name": user_id.title(), "avatar": "default"}
 
-    @app.get("/api/shared-documents/{document_id}")
-    async def shared_document(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.get("/api/records/{document_id}")
+    async def record_document(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         user = require_user(x_lab_user)
         if document_id != "shared-doc":
             raise HTTPException(status_code=404, detail="document not found")
         return {"id": document_id, "owner_id": "alice", "shared_with": ["bob"], "title": "Shared project brief", "viewer": user}
 
-    @app.get("/api/resource-metadata/{resource_id}")
-    async def resource_metadata(resource_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.get("/api/metadata/{resource_id}")
+    async def metadata(resource_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         require_user(x_lab_user)
         if resource_id != "item-1":
             raise HTTPException(status_code=404, detail="resource not found")
         return {"id": resource_id, "internal_id": "item-1", "label": "public benchmark item"}
 
-    @app.get("/api/config")
-    async def vulnerable_config(x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.get("/api/environment")
+    async def environment(x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         require_user(x_lab_user)
         return {"environment": "benchmark", "internal_email": "ops@example.test", "internal_host": "db.internal"}
 
-    @app.get("/api/secure-config")
-    async def secure_config(x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.get("/api/environment/details")
+    async def environment_details(x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         require_user(x_lab_user)
         return {"environment": "benchmark"}
 
-    @app.post("/api/rewards/redeem")
-    async def vulnerable_reward(request: Request, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.post("/api/promotions/apply")
+    async def promotion_apply(request: Request, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         user = require_user(x_lab_user)
         payload = await request.json()
         return {"redeemed": True, "code": payload.get("code", "WELCOME"), "discount": 20, "user": user}
 
-    @app.post("/api/secure-rewards/redeem")
-    async def secure_reward(request: Request, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+    @app.post("/api/promotions/submit")
+    async def promotion_submit(request: Request, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         user = require_user(x_lab_user)
         payload = await request.json()
         code = str(payload.get("code", "WELCOME"))
@@ -124,25 +124,33 @@ def create_benchmark_lab() -> FastAPI:
 
 def benchmark_profile(program_id: str) -> TargetProfile:
     operations = [
-        {"path": "/api/documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document by identifier."},
-        {"path": "/api/secure-documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document with an ownership control."},
-        {"path": "/api/config", "method": "GET", "kind": "information", "description": "Return environment configuration for authenticated users."},
-        {"path": "/api/secure-config", "method": "GET", "kind": "information", "description": "Return environment information intended for callers."},
-        {"path": "/api/rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a one-time reward code."},
-        {"path": "/api/secure-rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a reward code with state handling."},
-        {"path": "/api/public-profiles/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a public profile by identifier."},
-        {"path": "/api/shared-documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document shared with the caller."},
-        {"path": "/api/resource-metadata/{id}", "method": "GET", "kind": "information", "description": "Retrieve non-sensitive metadata for a resource."},
+        {"path": "/api/documents/{id}", "method": "GET", "description": "Retrieve a document by identifier."},
+        {"path": "/api/items/{id}", "method": "GET", "description": "Retrieve an item by identifier."},
+        {"path": "/api/environment", "method": "GET", "description": "Retrieve environment information."},
+        {"path": "/api/environment/details", "method": "GET", "description": "Retrieve environment details."},
+        {"path": "/api/promotions/apply", "method": "POST", "description": "Apply a promotion to the current account."},
+        {"path": "/api/promotions/submit", "method": "POST", "description": "Apply a promotion to the current account."},
+        {"path": "/api/users/{id}", "method": "GET", "description": "Retrieve a profile by identifier."},
+        {"path": "/api/records/{id}", "method": "GET", "description": "Retrieve a record by identifier."},
+        {"path": "/api/metadata/{id}", "method": "GET", "description": "Retrieve metadata associated with a resource."},
     ]
     return TargetProfile(
         program_id=program_id,
         asset="lab://benchmark",
         category="mixed",
         features=["authorization", "information", "business"],
-        public_brief="A local API exposes document retrieval, environment information, one-time reward operations, public profiles, shared documents, and resource metadata. Test accounts are researcher-owned. Determine whether the documented security boundaries hold.",
+        public_brief="A local API exposes document, item, environment, promotion, profile, record, and metadata operations. Test accounts are researcher-owned. Determine whether the documented business rules hold.",
         api_spec={"operations": operations},
         test_accounts=["account_a", "account_b"],
-        constraints=["Use only local lab targets.", "Do not infer a vulnerability from a status code alone.", "Compare control and test observations."],
+        constraints=[
+            "Use only local lab targets.",
+            "Do not infer a vulnerability from a status code alone.",
+            "Compare control and test observations.",
+            "Document access follows account ownership rules.",
+            "Each promotion code may be applied once per account.",
+            "Profile and record visibility follows product permissions.",
+            "Metadata identifiers do not change account permissions.",
+        ],
     )
 
 

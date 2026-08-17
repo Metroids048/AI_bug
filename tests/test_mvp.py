@@ -215,6 +215,29 @@ def test_real_provider_context_contains_no_benchmark_oracle(monkeypatch):
     assert "truth_vulnerable" not in prompt
 
 
+def test_compatible_provider_includes_schema_and_repairs_once(monkeypatch):
+    fixture = DeterministicProvider().plan("program", "lab://idor")
+    responses = [
+        {"choices": [{"message": {"content": "{\"invalid\": true}"}}], "usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+        {"choices": [{"message": {"content": fixture.data.model_dump_json()}}], "usage": {"prompt_tokens": 5, "completion_tokens": 7}},
+    ]
+    prompts: list[str] = []
+
+    def fake_post(*args, **kwargs):
+        prompts.append(kwargs["json"]["messages"][0]["content"])
+        return httpx.Response(200, json=responses[len(prompts) - 1])
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+    result = provider.plan("program", "lab://idor")
+    assert len(prompts) == 2
+    assert "JSON Schema" in prompts[0]
+    assert "hypotheses" in prompts[0]
+    assert "schema validation" in prompts[1]
+    assert result.usage.input_tokens == 8
+    assert result.usage.output_tokens == 9
+
+
 def test_invalid_state_transition_is_rejected():
     with pytest.raises(InvalidTransition):
         transition_research(ResearchState.HYPOTHESIS, ResearchState.SUBMISSION_READY)
@@ -267,14 +290,14 @@ def test_blind_benchmark_finds_vulnerable_cases_and_rejects_controls(repo, monke
     findings = [orchestrator.run(authorized_program, hypothesis, profile) for hypothesis in hypotheses]
     by_feature = {finding.title: finding.state for finding in findings}
     assert any("/api/documents/{id}" in title and state == ResearchState.SUBMISSION_READY for title, state in by_feature.items())
-    assert any("/api/config" in title and state == ResearchState.SUBMISSION_READY for title, state in by_feature.items())
-    assert any("/api/rewards/redeem" in title and state == ResearchState.SUBMISSION_READY for title, state in by_feature.items())
-    assert any("/api/secure-documents/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
-    assert any("/api/secure-config" in title and state == ResearchState.INVALID for title, state in by_feature.items())
-    assert any("/api/secure-rewards/redeem" in title and state == ResearchState.INVALID for title, state in by_feature.items())
-    assert any("/api/public-profiles/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
-    assert any("/api/shared-documents/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
-    assert any("/api/resource-metadata/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/environment" in title and state == ResearchState.SUBMISSION_READY for title, state in by_feature.items())
+    assert any("/api/promotions/apply" in title and state == ResearchState.SUBMISSION_READY for title, state in by_feature.items())
+    assert any("/api/items/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/environment/details" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/promotions/submit" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/users/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/records/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/metadata/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
     evidence = repo.get("evidence", findings[0].evidence_ids[0], Evidence)
     serialized = json.dumps(evidence.model_dump(mode="json"))
     assert "alice@example.test" not in serialized
@@ -305,6 +328,9 @@ def test_m26_three_round_nine_case_metrics_and_no_oracle_context(repo, monkeypat
     assert "control_target" not in serialized
     assert "test_target" not in serialized
     assert "truth_vulnerable" not in serialized
+    semantic_context = json.dumps({key: value for key, value in _provider_context(profile).items() if key != "public_brief"}, sort_keys=True).lower()
+    for marker in ("secure", "ownership control", "public", "shared", "non-sensitive", "state handling", '"kind"'):
+        assert marker not in semantic_context
     monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
     runs = ExperimentRunner(repo, BlindBenchmarkProvider()).run(program, profile, rounds=3)
     assert len(runs) == 3
@@ -320,3 +346,24 @@ def test_m26_three_round_nine_case_metrics_and_no_oracle_context(repo, monkeypat
     assert summary["evidence_failures"] == 0
     assert summary["gate_passed"] is True
     assert summary["gate_failures"] == []
+
+
+def test_neutral_benchmark_routes_return_expected_safe_controls():
+    executor = LocalLabExecutor(lab_name="benchmark")
+    for target, expected in [
+        ("lab://benchmark/api/items/doc-a", 403),
+        ("lab://benchmark/api/environment/details", 200),
+        ("lab://benchmark/api/promotions/submit", 200),
+        ("lab://benchmark/api/users/alice", 200),
+        ("lab://benchmark/api/records/shared-doc", 200),
+        ("lab://benchmark/api/metadata/item-1", 200),
+    ]:
+        observation = executor.execute(ActionProposal(
+            program_id="p", hypothesis_id="h", target=target, method="POST" if "promotions" in target else "GET",
+            action="WRITE_TEST_DATA" if "promotions" in target else "READ", risk="LOW", reason="test",
+            account_role="account_b", expected_behavior="response",
+            request_payload={"code": "WELCOME"} if "promotions" in target else None,
+        ))
+        assert observation.response_status == expected
+        if target.endswith("environment/details"):
+            assert "internal_email" not in observation.response_body

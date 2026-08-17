@@ -26,26 +26,26 @@ from .workflow import Planner, ResearchOrchestrator
 # never included in the provider context.
 SCENARIO_TRUTH: dict[str, bool] = {
     "/api/documents/{id}": True,
-    "/api/secure-documents/{id}": False,
-    "/api/config": True,
-    "/api/secure-config": False,
-    "/api/rewards/redeem": True,
-    "/api/secure-rewards/redeem": False,
-    "/api/public-profiles/{id}": False,
-    "/api/shared-documents/{id}": False,
-    "/api/resource-metadata/{id}": False,
+    "/api/items/{id}": False,
+    "/api/environment": True,
+    "/api/environment/details": False,
+    "/api/promotions/apply": True,
+    "/api/promotions/submit": False,
+    "/api/users/{id}": False,
+    "/api/records/{id}": False,
+    "/api/metadata/{id}": False,
 }
 
 SCENARIO_CLASS: dict[str, str] = {
     "/api/documents/{id}": "idor",
-    "/api/secure-documents/{id}": "idor",
-    "/api/config": "information",
-    "/api/secure-config": "information",
-    "/api/rewards/redeem": "business",
-    "/api/secure-rewards/redeem": "business",
-    "/api/public-profiles/{id}": "deceptive_public_data",
-    "/api/shared-documents/{id}": "deceptive_shared_resource",
-    "/api/resource-metadata/{id}": "deceptive_non_sensitive_id",
+    "/api/items/{id}": "idor",
+    "/api/environment": "information",
+    "/api/environment/details": "information",
+    "/api/promotions/apply": "business",
+    "/api/promotions/submit": "business",
+    "/api/users/{id}": "deceptive_profile",
+    "/api/records/{id}": "deceptive_record",
+    "/api/metadata/{id}": "deceptive_metadata",
 }
 
 
@@ -86,7 +86,7 @@ class ExperimentRunner:
                     (
                         item
                         for item in hypotheses
-                        if path in item.feature and item.feature.split(" ", 1)[0] == operation["method"]
+                        if item.feature.split(" ", 1)[-1] == path and item.feature.split(" ", 1)[0] == operation["method"]
                     ),
                     None,
                 )
@@ -101,7 +101,7 @@ class ExperimentRunner:
         operations = list(profile.api_spec.get("operations", []))
         random.Random(f"{profile.id}:{round_number}").shuffle(operations)
         public_operations = [
-            {key: operation[key] for key in ("path", "method", "kind", "description") if key in operation}
+            {key: operation[key] for key in ("path", "method", "description") if key in operation}
             for operation in operations
         ]
         run_profile = profile.model_copy(

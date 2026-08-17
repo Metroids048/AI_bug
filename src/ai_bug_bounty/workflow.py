@@ -36,7 +36,7 @@ def _provider_context(profile: TargetProfile | None) -> dict[str, Any]:
     public_operations = [
         {
             key: operation[key]
-            for key in ("path", "method", "kind", "description")
+            for key in ("path", "method", "description")
             if key in operation
         }
         for operation in profile.api_spec.get("operations", [])

@@ -1,6 +1,6 @@
 # AI Bug Bounty Researcher
 
-这是一个安全优先的离线 M2.5，用于验证“真实模型研究 + 客观验证证据 + 对抗审查”是否能形成可回放的研究闭环。
+这是一个安全优先的离线 M2.6.1，用于验证“真实模型研究 + 客观验证证据 + 对抗审查”是否能形成可回放的研究闭环。当前代码已完成盲测输入审计和 Provider Schema contract 修复，但真实模型 Gate 尚未运行。
 
 当前 Benchmark 运行进程内 `lab://benchmark` 靶场，包含 IDOR、信息泄露和业务状态的易受攻击/安全对照。任何 `http://`、`https://` 或未知目标都会被执行器拒绝；系统不会扫描真实网站，也不会自动提交平台报告。
 
@@ -35,6 +35,8 @@ abb experiment-summary --program-id <PROGRAM_ID> --db data/benchmark.sqlite3
 ```
 
 每轮都会重排 9 个本地场景并创建新的 Planner context；结果单独写入 `experiment_run` / `experiment_case_result`，输出 TP、FP、FN、Precision、Recall、Scope Violation、Reproduction、Evidence、Token、Cost 和 Gate。`blind` 只用于离线回归，不代表真实模型能力。
+
+M2.6.1 已移除模型可见输入中的 `kind`、漏洞/安全标签、带有安全结论的路径和描述；Ground Truth 只保留在实验指标边界。OpenAI-compatible Provider 会把目标 Pydantic JSON Schema 放进提示词，可选发送 `response_format=json_schema`，并在 Schema 校验失败时最多进行一次不补充业务答案的修复请求。
 
 ## Optional model endpoint
 

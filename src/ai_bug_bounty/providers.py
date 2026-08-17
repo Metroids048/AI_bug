@@ -170,7 +170,7 @@ class BlindBenchmarkProvider(Provider):
             path = operation["path"]
             method = operation["method"].upper()
             description = operation.get("description", "")
-            kind = operation.get("kind", "authorization")
+            kind = _benchmark_kind(path)
             if kind == "authorization":
                 boundary = "A resource owner may access its resource; another account should be denied."
                 statement = "The endpoint may accept a resource identifier without enforcing ownership."
@@ -218,9 +218,10 @@ class BlindBenchmarkProvider(Provider):
         return ProviderResult(batch, self.name, self.model, ProviderUsage(input_tokens=0, output_tokens=0), 0.0, 0.0)
 
     def validation_plan(self, hypothesis: Hypothesis, context: dict[str, Any]) -> ProviderResult:
-        operation = next(item for item in context.get("operations", []) if item["path"] in hypothesis.feature)
+        feature_path = hypothesis.feature.split(" ", 1)[1] if " " in hypothesis.feature else hypothesis.feature
+        operation = next(item for item in context.get("operations", []) if item["path"] == feature_path)
         target_path = _benchmark_target_path(operation["path"])
-        is_business = operation.get("kind") == "business"
+        is_business = _benchmark_kind(operation["path"]) == "business"
         account = "account_a"
         test_account = "account_a" if is_business else "account_b"
         steps = [
@@ -289,14 +290,65 @@ class OpenAICompatibleProvider(Provider):
             raise ProviderDisabled("Model network is disabled; enable it explicitly for a smoke test.")
         if not self.api_key:
             raise ProviderDisabled("Model API key is missing; set ABB_LLM_API_KEY explicitly.")
-        prompt = (
-            "Return JSON only matching the requested schema. Do not invent observations or scope. "
-            f"Task: {task}\nContext: {json.dumps(context, sort_keys=True)}"
+        schema_json = json.dumps(schema.model_json_schema(), sort_keys=True)
+        prompt = self._prompt(task, context, schema_json)
+        _, content, usage = self._request(prompt, schema)
+        try:
+            result = schema.model_validate_json(content)
+        except Exception as first_error:
+            repair_prompt = self._prompt(
+                task,
+                context,
+                schema_json,
+                repair=f"The previous JSON failed schema validation: {str(first_error)[:1000]}",
+                previous_response=content,
+            )
+            _, repair_content, repair_usage = self._request(repair_prompt, schema)
+            usage = _merge_usage(usage, repair_usage)
+            try:
+                result = schema.model_validate_json(repair_content)
+            except Exception as second_error:
+                raise ValueError(f"Provider response failed schema validation after one repair: {second_error}") from second_error
+        return ProviderResult(
+            result, self.name, self.model,
+            ProviderUsage(input_tokens=usage.get("prompt_tokens"), output_tokens=usage.get("completion_tokens")),
+            self.input_price_per_million, self.output_price_per_million,
         )
+
+    def _prompt(
+        self,
+        task: str,
+        context: dict[str, Any],
+        schema_json: str,
+        repair: str | None = None,
+        previous_response: str | None = None,
+    ) -> str:
+        lines = [
+            "Return exactly one JSON object and no Markdown.",
+            "Use only facts from Context; do not invent scope, accounts, observations, or business rules.",
+            f"Task: {task}",
+            f"JSON Schema: {schema_json}",
+            f"Context: {json.dumps(context, sort_keys=True)}",
+        ]
+        if repair:
+            lines.extend([repair, f"Previous response to repair: {previous_response or ''}"])
+        return "\n".join(lines)
+
+    def _request(self, prompt: str, schema: type[T]) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        request_json: dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if os.getenv("ABB_LLM_STRUCTURED_OUTPUT", "false").lower() == "true":
+            request_json["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": schema.__name__, "strict": True, "schema": schema.model_json_schema()},
+            }
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json={"model": self.model, "temperature": 0, "messages": [{"role": "user", "content": prompt}]},
+            json=request_json,
             timeout=30,
         )
         # Mock transports may not attach a Request object; status-code gating
@@ -304,18 +356,8 @@ class OpenAICompatibleProvider(Provider):
         if response.status_code >= 400:
             response.raise_for_status()
         payload = response.json()
-        content = payload["choices"][0]["message"]["content"]
-        if content.strip().startswith("```"):
-            content = content.strip().strip("`")
-            if content.startswith("json"):
-                content = content[4:]
-        usage = payload.get("usage", {})
-        result = schema.model_validate_json(content)
-        return ProviderResult(
-            result, self.name, self.model,
-            ProviderUsage(input_tokens=usage.get("prompt_tokens"), output_tokens=usage.get("completion_tokens")),
-            self.input_price_per_million, self.output_price_per_million,
-        )
+        content = _clean_json_content(payload["choices"][0]["message"]["content"])
+        return payload, content, payload.get("usage", {})
 
     def plan(self, program_id: str, asset: str, context: dict[str, Any] | None = None) -> ProviderResult:
         return self._call("planner", {"program_id": program_id, "asset": asset, **(context or {})}, HypothesisBatch)
@@ -356,15 +398,43 @@ def _optional_float(value: str | None) -> float | None:
     return float(value) if value not in {None, ""} else None
 
 
+def _clean_json_content(content: str) -> str:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().lower() in {"```", "```json"}:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def _merge_usage(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for key in ("prompt_tokens", "completion_tokens"):
+        left, right = first.get(key), second.get(key)
+        merged[key] = left + right if isinstance(left, int) and isinstance(right, int) else None
+    return merged
+
+
 def _benchmark_target_path(path: str) -> str:
     replacements = {
         "/api/documents/{id}": "/api/documents/doc-a",
-        "/api/secure-documents/{id}": "/api/secure-documents/doc-a",
-        "/api/public-profiles/{id}": "/api/public-profiles/alice",
-        "/api/shared-documents/{id}": "/api/shared-documents/shared-doc",
-        "/api/resource-metadata/{id}": "/api/resource-metadata/item-1",
+        "/api/items/{id}": "/api/items/doc-a",
+        "/api/users/{id}": "/api/users/alice",
+        "/api/records/{id}": "/api/records/shared-doc",
+        "/api/metadata/{id}": "/api/metadata/item-1",
     }
     return replacements.get(path, path)
+
+
+def _benchmark_kind(path: str) -> str:
+    if path in {"/api/promotions/apply", "/api/promotions/submit"}:
+        return "business"
+    if path in {"/api/environment", "/api/environment/details", "/api/metadata/{id}"}:
+        return "information"
+    return "authorization"
 
 
 def _evidence_supports_boundary(evidence: list[dict[str, Any]]) -> bool:
