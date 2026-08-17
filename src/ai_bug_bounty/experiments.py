@@ -112,6 +112,10 @@ class ExperimentRunner:
             "public_brief": run_profile.public_brief,
             "api_spec": run_profile.api_spec,
             "test_accounts": run_profile.test_accounts,
+            "test_resources": {
+                name: resource.model_dump(mode="json") for name, resource in run_profile.test_resources.items()
+            },
+            "test_inputs": run_profile.test_inputs,
             "constraints": run_profile.constraints,
         }
         context_hash = hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

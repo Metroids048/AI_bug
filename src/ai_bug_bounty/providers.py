@@ -231,7 +231,7 @@ class BlindBenchmarkProvider(Provider):
                 account_role=account, resource_key=operation["path"],
                 expected_behavior="The permitted control should succeed without exposing unrelated data.",
                 expected_status=200,
-                request_payload={"code": "WELCOME"} if is_business else None,
+                request_payload={"code": context.get("test_inputs", {}).get("promotion_code", "WELCOME")} if is_business else None,
             ),
             ValidationStep(
                 phase="TEST", target=f"lab://benchmark{target_path}", method=operation["method"],
@@ -239,7 +239,7 @@ class BlindBenchmarkProvider(Provider):
                 account_role=test_account, resource_key=operation["path"],
                 expected_behavior="The boundary-breaking test should be denied or return no protected fields.",
                 expected_status=409 if is_business else 403,
-                request_payload={"code": "WELCOME"} if is_business else None,
+                request_payload={"code": context.get("test_inputs", {}).get("promotion_code", "WELCOME")} if is_business else None,
             ),
         ]
         return ProviderResult(
@@ -421,9 +421,9 @@ def _merge_usage(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any
 def _benchmark_target_path(path: str) -> str:
     replacements = {
         "/api/documents/{id}": "/api/documents/doc-a",
-        "/api/items/{id}": "/api/items/doc-a",
+        "/api/items/{id}": "/api/items/item-a",
         "/api/users/{id}": "/api/users/alice",
-        "/api/records/{id}": "/api/records/shared-doc",
+        "/api/records/{id}": "/api/records/record-a",
         "/api/metadata/{id}": "/api/metadata/item-1",
     }
     return replacements.get(path, path)

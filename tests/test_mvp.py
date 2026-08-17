@@ -213,6 +213,26 @@ def test_real_provider_context_contains_no_benchmark_oracle(monkeypatch):
     assert "control_target" not in prompt
     assert "test_target" not in prompt
     assert "truth_vulnerable" not in prompt
+    assert '"test_resources"' in prompt
+    assert '"doc-a"' in prompt
+    assert '"promotion_code": "WELCOME"' in prompt
+    assert "shared-doc" not in prompt
+
+
+def test_research_fixture_metadata_is_neutral_and_structured():
+    profile = benchmark_profile("program")
+    context = _provider_context(profile)
+    assert context["test_accounts"] == ["account_a", "account_b"]
+    assert context["test_resources"] == {
+        "document_a": {"id": "doc-a", "created_by": "account_a"},
+        "item_a": {"id": "item-a", "created_by": "account_a"},
+        "record_a": {"id": "record-a", "created_by": None},
+        "metadata_a": {"id": "item-1", "created_by": None},
+    }
+    assert context["test_inputs"] == {"promotion_code": "WELCOME"}
+    serialized = json.dumps(context, sort_keys=True).lower()
+    for marker in ("truth_vulnerable", "expected_status", "should_deny", "vulnerable", "safe", "shared-doc"):
+        assert marker not in serialized
 
 
 def test_compatible_provider_includes_schema_and_repairs_once(monkeypatch):
@@ -351,11 +371,11 @@ def test_m26_three_round_nine_case_metrics_and_no_oracle_context(repo, monkeypat
 def test_neutral_benchmark_routes_return_expected_safe_controls():
     executor = LocalLabExecutor(lab_name="benchmark")
     for target, expected in [
-        ("lab://benchmark/api/items/doc-a", 403),
+        ("lab://benchmark/api/items/item-a", 403),
         ("lab://benchmark/api/environment/details", 200),
         ("lab://benchmark/api/promotions/submit", 200),
         ("lab://benchmark/api/users/alice", 200),
-        ("lab://benchmark/api/records/shared-doc", 200),
+        ("lab://benchmark/api/records/record-a", 200),
         ("lab://benchmark/api/metadata/item-1", 200),
     ]:
         observation = executor.execute(ActionProposal(

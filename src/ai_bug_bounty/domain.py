@@ -172,6 +172,11 @@ class ProgramPolicySnapshot(StrictModel):
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+class TestResource(StrictModel):
+    id: str
+    created_by: str | None = None
+
+
 class TargetProfile(StrictModel):
     id: str = Field(default_factory=new_id)
     program_id: str
@@ -181,6 +186,8 @@ class TargetProfile(StrictModel):
     public_brief: str = ""
     api_spec: dict[str, Any] = Field(default_factory=dict)
     test_accounts: list[str] = Field(default_factory=list)
+    test_resources: dict[str, TestResource] = Field(default_factory=dict)
+    test_inputs: dict[str, str] = Field(default_factory=dict)
     constraints: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=now_utc)
 

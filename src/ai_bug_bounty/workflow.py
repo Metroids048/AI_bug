@@ -47,6 +47,10 @@ def _provider_context(profile: TargetProfile | None) -> dict[str, Any]:
         "api_spec": {"operations": public_operations},
         "operations": public_operations,
         "test_accounts": profile.test_accounts,
+        "test_resources": {
+            name: resource.model_dump(mode="json") for name, resource in profile.test_resources.items()
+        },
+        "test_inputs": profile.test_inputs,
         "constraints": profile.constraints,
     }
 

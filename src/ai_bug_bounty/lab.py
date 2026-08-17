@@ -7,7 +7,7 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 
-from .domain import ActionProposal, Observation, TargetProfile
+from .domain import ActionProposal, Observation, TargetProfile, TestResource
 
 ACCOUNT_USERS = {"account_a": "alice", "account_b": "bob"}
 
@@ -65,7 +65,7 @@ def create_benchmark_lab() -> FastAPI:
     @app.get("/api/items/{document_id}")
     async def item_document(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         user = require_user(x_lab_user)
-        if document_id != "doc-a":
+        if document_id != "item-a":
             raise HTTPException(status_code=404, detail="document not found")
         if user != "alice":
             raise HTTPException(status_code=403, detail="forbidden")
@@ -81,9 +81,9 @@ def create_benchmark_lab() -> FastAPI:
     @app.get("/api/records/{document_id}")
     async def record_document(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         user = require_user(x_lab_user)
-        if document_id != "shared-doc":
+        if document_id != "record-a":
             raise HTTPException(status_code=404, detail="document not found")
-        return {"id": document_id, "owner_id": "alice", "shared_with": ["bob"], "title": "Shared project brief", "viewer": user}
+        return {"id": document_id, "owner_id": "alice", "shared_with": ["bob"], "title": "Project brief", "viewer": user}
 
     @app.get("/api/metadata/{resource_id}")
     async def metadata(resource_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
@@ -142,6 +142,13 @@ def benchmark_profile(program_id: str) -> TargetProfile:
         public_brief="A local API exposes document, item, environment, promotion, profile, record, and metadata operations. Test accounts are researcher-owned. Determine whether the documented business rules hold.",
         api_spec={"operations": operations},
         test_accounts=["account_a", "account_b"],
+        test_resources={
+            "document_a": TestResource(id="doc-a", created_by="account_a"),
+            "item_a": TestResource(id="item-a", created_by="account_a"),
+            "record_a": TestResource(id="record-a"),
+            "metadata_a": TestResource(id="item-1"),
+        },
+        test_inputs={"promotion_code": "WELCOME"},
         constraints=[
             "Use only local lab targets.",
             "Do not infer a vulnerability from a status code alone.",
