@@ -349,6 +349,7 @@ class CostEntry(StrictModel):
     task: str
     program_id: str | None = None
     finding_id: str | None = None
+    experiment_run_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     input_price_per_million: float | None = None
@@ -413,6 +414,53 @@ class PlatformResult(StrictModel):
     submitted_at: datetime | None = None
     triaged_at: datetime | None = None
     paid_at: datetime | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class ExperimentRun(StrictModel):
+    id: str = Field(default_factory=new_id)
+    program_id: str
+    provider: str
+    model: str
+    round_number: int = Field(ge=1)
+    context_hash: str
+    scenario_order: list[str] = Field(default_factory=list)
+    total_cases: int = 0
+    true_positive: int = 0
+    false_positive: int = 0
+    false_negative: int = 0
+    precision: float | None = None
+    recall: float | None = None
+    scope_violations: int = 0
+    reproduction_failures: int = 0
+    evidence_failures: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    known_cost: float = 0.0
+    unknown_cost_entries: int = 0
+    created_at: datetime = Field(default_factory=now_utc)
+    completed_at: datetime | None = None
+
+
+class ExperimentCaseResult(StrictModel):
+    id: str = Field(default_factory=new_id)
+    experiment_run_id: str
+    program_id: str
+    scenario_key: str
+    scenario_class: str
+    truth_vulnerable: bool
+    finding_id: str | None = None
+    finding_state: ResearchState | None = None
+    true_positive: bool = False
+    false_positive: bool = False
+    false_negative: bool = False
+    scope_violations: int = 0
+    reproductions: int = 0
+    evidence_complete: bool = False
+    input_tokens: int = 0
+    output_tokens: int = 0
+    known_cost: float = 0.0
+    unknown_cost_entries: int = 0
     created_at: datetime = Field(default_factory=now_utc)
 
 

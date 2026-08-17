@@ -137,7 +137,7 @@ class DeterministicProvider(Provider):
         )
 
     def skeptic(self, context: dict[str, Any]) -> ProviderResult:
-        supports = bool(context.get("security_boundary_broken"))
+        supports = _evidence_supports_boundary(context.get("evidence", []))
         result = SkepticResult(
             supports_finding=supports,
             counterarguments=[] if supports else ["The observed response does not cross an account boundary."],
@@ -219,21 +219,26 @@ class BlindBenchmarkProvider(Provider):
 
     def validation_plan(self, hypothesis: Hypothesis, context: dict[str, Any]) -> ProviderResult:
         operation = next(item for item in context.get("operations", []) if item["path"] in hypothesis.feature)
+        target_path = _benchmark_target_path(operation["path"])
+        is_business = operation.get("kind") == "business"
+        account = "account_a"
+        test_account = "account_a" if is_business else "account_b"
         steps = [
             ValidationStep(
-                phase="CONTROL", target=operation["control_target"], method=operation["method"], action="READ",
-                account_role=operation["control_account"], resource_key=operation["resource_key"],
+                phase="CONTROL", target=f"lab://benchmark{target_path}", method=operation["method"],
+                action="WRITE_TEST_DATA" if is_business else "READ",
+                account_role=account, resource_key=operation["path"],
                 expected_behavior="The permitted control should succeed without exposing unrelated data.",
-                expected_status=operation.get("control_status", 200),
-                request_payload={"code": "WELCOME"} if operation.get("kind") == "business" else None,
+                expected_status=200,
+                request_payload={"code": "WELCOME"} if is_business else None,
             ),
             ValidationStep(
-                phase="TEST", target=operation["test_target"], method=operation["method"],
-                action=operation.get("test_action", "READ_OTHER_TEST_ACCOUNT_DATA"),
-                account_role=operation["test_account"], resource_key=operation["resource_key"],
+                phase="TEST", target=f"lab://benchmark{target_path}", method=operation["method"],
+                action="WRITE_TEST_DATA" if is_business else "READ_OTHER_TEST_ACCOUNT_DATA",
+                account_role=test_account, resource_key=operation["path"],
                 expected_behavior="The boundary-breaking test should be denied or return no protected fields.",
-                expected_status=operation.get("test_status", 403),
-                request_payload={"code": "WELCOME"} if operation.get("kind") == "business" else None,
+                expected_status=409 if is_business else 403,
+                request_payload={"code": "WELCOME"} if is_business else None,
             ),
         ]
         return ProviderResult(
@@ -242,7 +247,7 @@ class BlindBenchmarkProvider(Provider):
         )
 
     def skeptic(self, context: dict[str, Any]) -> ProviderResult:
-        broken = bool(context.get("security_boundary_broken"))
+        broken = _evidence_supports_boundary(context.get("evidence", []))
         result = SkepticResult(
             supports_finding=broken,
             counterarguments=[] if broken else ["The control and test observations do not demonstrate unauthorized behavior."],
@@ -349,3 +354,39 @@ def provider_factory(name: str | None = None) -> Provider:
 
 def _optional_float(value: str | None) -> float | None:
     return float(value) if value not in {None, ""} else None
+
+
+def _benchmark_target_path(path: str) -> str:
+    replacements = {
+        "/api/documents/{id}": "/api/documents/doc-a",
+        "/api/secure-documents/{id}": "/api/secure-documents/doc-a",
+        "/api/public-profiles/{id}": "/api/public-profiles/alice",
+        "/api/shared-documents/{id}": "/api/shared-documents/shared-doc",
+        "/api/resource-metadata/{id}": "/api/resource-metadata/item-1",
+    }
+    return replacements.get(path, path)
+
+
+def _evidence_supports_boundary(evidence: list[dict[str, Any]]) -> bool:
+    for item in evidence:
+        if item.get("phase") != "TEST":
+            continue
+        body = item.get("response", {})
+        if _contains_boundary_marker(body):
+            return True
+    return False
+
+
+def _contains_boundary_marker(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).lower()
+            if any(marker in normalized for marker in ("private", "secret", "token", "email")):
+                return True
+            if normalized == "redeemed" and item is True:
+                return True
+            if _contains_boundary_marker(item):
+                return True
+    if isinstance(value, list):
+        return any(_contains_boundary_marker(item) for item in value)
+    return False

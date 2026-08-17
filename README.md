@@ -27,9 +27,18 @@ abb audit-replay --db data/benchmark.sqlite3
 
 `benchmark-create` 只创建 `REVIEW_REQUIRED` Program。必须人工确认 Scope 哈希后才能授权。`program-create` 对自动化、跨账户测试、速率和测试账户规则默认保存为 `UNKNOWN`；任何 UNKNOWN 都不能授权。
 
+## M2.6 blind experiment
+
+```powershell
+abb experiment-run <PROGRAM_ID> --provider blind --rounds 3 --db data/benchmark.sqlite3
+abb experiment-summary --program-id <PROGRAM_ID> --db data/benchmark.sqlite3
+```
+
+每轮都会重排 9 个本地场景并创建新的 Planner context；结果单独写入 `experiment_run` / `experiment_case_result`，输出 TP、FP、FN、Precision、Recall、Scope Violation、Reproduction、Evidence、Token、Cost 和 Gate。`blind` 只用于离线回归，不代表真实模型能力。
+
 ## Optional model endpoint
 
-真实 Research 通过 `--provider openai-compatible` 接入 DeepSeek、CC Switch 或其他兼容中转；必须显式设置 `ABB_LLM_NETWORK_ENABLED=true`、`ABB_LLM_API_KEY`、`ABB_LLM_BASE_URL`、`ABB_LLM_MODEL` 和价格环境变量。`blind` Provider 只用于离线 Benchmark 回归，不代表真实 AI 发现能力。
+真实 Research 通过 `--provider openai-compatible` 接入 DeepSeek、CC Switch 或其他兼容中转；必须显式设置 `ABB_LLM_NETWORK_ENABLED=true`、`ABB_LLM_API_KEY`、`ABB_LLM_BASE_URL`、`ABB_LLM_MODEL` 和价格环境变量，然后运行同一条 `experiment-run --rounds 3`。模型 API 可联网，但 Target Executor 仍只接受 `lab://benchmark`；缺少 usage 或价格会记录为 UNKNOWN，Real-Model Gate 不得宣称通过。
 
 Program Policy Snapshot 保存原始规则、来源 URL、采集时间、Policy Hash、解析 Scope/Out-of-Scope 和规则快照。Scope Matcher 支持 scheme、host、port、显式 host/path wildcard，并且 Out-of-Scope 优先级高于 In-Scope。
 

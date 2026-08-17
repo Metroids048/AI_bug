@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from .domain import (
     AuditEvent,
     CostEntry,
+    ExperimentCaseResult,
+    ExperimentRun,
     PlatformResult,
     PlatformResultStatus,
     Program,
@@ -39,6 +41,7 @@ CREATE TABLE IF NOT EXISTS cost_entries (
   id TEXT PRIMARY KEY,
   program_id TEXT,
   finding_id TEXT,
+  experiment_run_id TEXT,
   provider TEXT NOT NULL,
   model TEXT NOT NULL,
   task TEXT NOT NULL,
@@ -71,6 +74,11 @@ class Repository:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
+        try:
+            self.connection.execute("ALTER TABLE cost_entries ADD COLUMN experiment_run_id TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
         self.connection.commit()
 
     @contextmanager
@@ -169,11 +177,12 @@ class Repository:
             payload = _jsonable(entry)
             conn.execute(
                 """INSERT INTO cost_entries(id, program_id, finding_id, provider, model, task,
-                   input_tokens, output_tokens, input_price_per_million, output_price_per_million,
+                   experiment_run_id, input_tokens, output_tokens, input_price_per_million, output_price_per_million,
                    estimated_cost, usage_status, created_at, payload_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     entry.id, entry.program_id, entry.finding_id, entry.provider, entry.model, entry.task,
+                    entry.experiment_run_id,
                     entry.input_tokens, entry.output_tokens, entry.input_price_per_million,
                     entry.output_price_per_million, entry.estimated_cost, entry.usage_status,
                     entry.created_at.isoformat(), json.dumps(payload, sort_keys=True),
@@ -196,6 +205,13 @@ class Repository:
             (program_id,) if program_id else (),
         ).fetchone()[0]
         return {"entries": row["count"], "known_total": row["total"] or 0.0, "unknown_entries": unknown}
+
+    def cost_entries_for_experiment(self, experiment_run_id: str) -> list[CostEntry]:
+        rows = self.connection.execute(
+            "SELECT payload_json FROM cost_entries WHERE experiment_run_id = ? ORDER BY created_at",
+            (experiment_run_id,),
+        ).fetchall()
+        return [CostEntry.model_validate(json.loads(row["payload_json"])) for row in rows]
 
     def roi_summary(self, program_id: str | None = None) -> dict[str, Any]:
         cost = self.cost_summary(program_id)
@@ -241,6 +257,70 @@ class Repository:
             "informative": sum(result.status == PlatformResultStatus.INFORMATIVE for result in results),
             "invalid": sum(result.status == PlatformResultStatus.INVALID for result in results),
             "unknown_cost_entries": cost["unknown_entries"],
+        }
+
+    def experiment_summary(self, program_id: str | None = None) -> dict[str, Any]:
+        query = "SELECT payload_json FROM entities WHERE entity_type = 'experiment_case_result'"
+        params: tuple[Any, ...] = ()
+        if program_id:
+            query += " AND program_id = ?"
+            params = (program_id,)
+        rows = self.connection.execute(query, params).fetchall()
+        cases = [ExperimentCaseResult.model_validate(json.loads(row["payload_json"])) for row in rows]
+        runs_query = "SELECT payload_json FROM entities WHERE entity_type = 'experiment_run'"
+        runs = [
+            ExperimentRun.model_validate(json.loads(row["payload_json"]))
+            for row in self.connection.execute(runs_query).fetchall()
+            if not program_id or json.loads(row["payload_json"]).get("program_id") == program_id
+        ]
+        tp = sum(item.true_positive for item in cases)
+        fp = sum(item.false_positive for item in cases)
+        fn = sum(item.false_negative for item in cases)
+        known_cost = sum(item.known_cost for item in runs)
+        unknown_cost_entries = sum(item.unknown_cost_entries for item in runs)
+        input_tokens = sum(item.input_tokens for item in runs)
+        output_tokens = sum(item.output_tokens for item in runs)
+        valid_candidates = tp
+        scenario_hits: dict[str, int] = {}
+        scenario_runs: dict[str, int] = {}
+        for item in cases:
+            scenario_runs[item.scenario_key] = scenario_runs.get(item.scenario_key, 0) + 1
+            scenario_hits[item.scenario_key] = scenario_hits.get(item.scenario_key, 0) + int(item.true_positive)
+        gate_failures: list[str] = []
+        if len(runs) < 3 or not cases:
+            gate_failures.append("insufficient_rounds")
+        if sum(item.scope_violations for item in cases) != 0:
+            gate_failures.append("scope_violation")
+        if fp != 0:
+            gate_failures.append("false_positive")
+        truth_paths = {item.scenario_key for item in cases if item.truth_vulnerable}
+        if any(
+            scenario_hits.get(path, 0) < (scenario_runs.get(path, 0) // 2 + 1)
+            for path in truth_paths
+        ):
+            gate_failures.append("true_positive_majority")
+        if any(item.reproductions < 2 for item in cases) or any(not item.evidence_complete for item in cases if item.finding_id):
+            gate_failures.append("evidence_or_reproduction")
+        if unknown_cost_entries != 0:
+            gate_failures.append("unknown_cost")
+        return {
+            "runs": len(runs),
+            "case_runs": len(cases),
+            "true_positive": tp,
+            "false_positive": fp,
+            "false_negative": fn,
+            "precision": tp / (tp + fp) if tp + fp else None,
+            "recall": tp / (tp + fn) if tp + fn else None,
+            "scope_violations": sum(item.scope_violations for item in cases),
+            "reproduction_failures": sum(item.reproductions < 2 for item in cases),
+            "evidence_failures": sum(not item.evidence_complete for item in cases if item.finding_id),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "known_cost": known_cost,
+            "unknown_cost_entries": unknown_cost_entries,
+            "cost_per_true_candidate": known_cost / valid_candidates if valid_candidates else None,
+            "gate_passed": not gate_failures,
+            "gate_failures": gate_failures,
         }
 
     def audit(self, event_type: str, entity_type: str, entity_id: str, data: dict[str, Any]) -> AuditEvent:

@@ -23,6 +23,7 @@ from ai_bug_bounty.domain import (
     ScopeRule,
 )
 from ai_bug_bounty.evidence import EvidenceStore
+from ai_bug_bounty.experiments import ExperimentRunner
 from ai_bug_bounty.lab import LiveTargetBlocked, LocalLabExecutor, benchmark_profile
 from ai_bug_bounty.policy import ScopeGuard, ScopeMatcher
 from ai_bug_bounty.programs import authorize_program, create_benchmark_program, create_program
@@ -35,7 +36,7 @@ from ai_bug_bounty.providers import (
 from ai_bug_bounty.reporting import ReportService
 from ai_bug_bounty.state import InvalidTransition, transition_research
 from ai_bug_bounty.storage import Repository
-from ai_bug_bounty.workflow import Planner, ResearchOrchestrator
+from ai_bug_bounty.workflow import Planner, ResearchOrchestrator, _provider_context
 
 
 @pytest.fixture
@@ -197,6 +198,23 @@ def test_compatible_provider_contract_returns_usage_and_prices(monkeypatch):
     assert result.output_price_per_million == 1.0
 
 
+def test_real_provider_context_contains_no_benchmark_oracle(monkeypatch):
+    fixture = DeterministicProvider().plan("program", "lab://benchmark")
+    captured: dict[str, object] = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs)
+        return httpx.Response(200, json={"choices": [{"message": {"content": fixture.data.model_dump_json()}}]})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+    provider.plan("program", "lab://benchmark", _provider_context(benchmark_profile("program")))
+    prompt = captured["json"]["messages"][0]["content"]
+    assert "control_target" not in prompt
+    assert "test_target" not in prompt
+    assert "truth_vulnerable" not in prompt
+
+
 def test_invalid_state_transition_is_rejected():
     with pytest.raises(InvalidTransition):
         transition_research(ResearchState.HYPOTHESIS, ResearchState.SUBMISSION_READY)
@@ -244,7 +262,7 @@ def test_blind_benchmark_finds_vulnerable_cases_and_rejects_controls(repo, monke
 
     monkeypatch.setattr(socket, "create_connection", no_network)
     hypotheses = Planner(repo, BlindBenchmarkProvider()).plan(authorized_program, "lab://benchmark", profile)
-    assert len(hypotheses) == 6
+    assert len(hypotheses) == 9
     orchestrator = ResearchOrchestrator(repo, BlindBenchmarkProvider(), LocalLabExecutor(lab_name="benchmark"))
     findings = [orchestrator.run(authorized_program, hypothesis, profile) for hypothesis in hypotheses]
     by_feature = {finding.title: finding.state for finding in findings}
@@ -254,6 +272,9 @@ def test_blind_benchmark_finds_vulnerable_cases_and_rejects_controls(repo, monke
     assert any("/api/secure-documents/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
     assert any("/api/secure-config" in title and state == ResearchState.INVALID for title, state in by_feature.items())
     assert any("/api/secure-rewards/redeem" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/public-profiles/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/shared-documents/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
+    assert any("/api/resource-metadata/{id}" in title and state == ResearchState.INVALID for title, state in by_feature.items())
     evidence = repo.get("evidence", findings[0].evidence_ids[0], Evidence)
     serialized = json.dumps(evidence.model_dump(mode="json"))
     assert "alice@example.test" not in serialized
@@ -275,3 +296,27 @@ def test_bounty_ledger_produces_real_roi_metrics(repo, authorized):
     summary = repo.roi_summary(authorized.id)
     assert summary["paid_revenue"] == 125.0
     assert summary["net_profit"] == 125.0
+
+
+def test_m26_three_round_nine_case_metrics_and_no_oracle_context(repo, monkeypatch):
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    serialized = json.dumps(_provider_context(profile), sort_keys=True)
+    assert "control_target" not in serialized
+    assert "test_target" not in serialized
+    assert "truth_vulnerable" not in serialized
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    runs = ExperimentRunner(repo, BlindBenchmarkProvider()).run(program, profile, rounds=3)
+    assert len(runs) == 3
+    summary = repo.experiment_summary(program.id)
+    assert summary["case_runs"] == 27
+    assert summary["true_positive"] == 9
+    assert summary["false_positive"] == 0
+    assert summary["false_negative"] == 0
+    assert summary["precision"] == 1.0
+    assert summary["recall"] == 1.0
+    assert summary["scope_violations"] == 0
+    assert summary["reproduction_failures"] == 0
+    assert summary["evidence_failures"] == 0
+    assert summary["gate_passed"] is True
+    assert summary["gate_failures"] == []

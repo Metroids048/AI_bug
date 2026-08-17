@@ -71,6 +71,27 @@ def create_benchmark_lab() -> FastAPI:
             raise HTTPException(status_code=403, detail="forbidden")
         return {"id": document_id, "owner_id": "alice", "private_note": "benchmark private note", "viewer": user}
 
+    @app.get("/api/public-profiles/{user_id}")
+    async def public_profile(user_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user(x_lab_user)
+        if user_id not in {"alice", "bob"}:
+            raise HTTPException(status_code=404, detail="profile not found")
+        return {"user_id": user_id, "display_name": user_id.title(), "avatar": "default"}
+
+    @app.get("/api/shared-documents/{document_id}")
+    async def shared_document(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        user = require_user(x_lab_user)
+        if document_id != "shared-doc":
+            raise HTTPException(status_code=404, detail="document not found")
+        return {"id": document_id, "owner_id": "alice", "shared_with": ["bob"], "title": "Shared project brief", "viewer": user}
+
+    @app.get("/api/resource-metadata/{resource_id}")
+    async def resource_metadata(resource_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user(x_lab_user)
+        if resource_id != "item-1":
+            raise HTTPException(status_code=404, detail="resource not found")
+        return {"id": resource_id, "internal_id": "item-1", "label": "public benchmark item"}
+
     @app.get("/api/config")
     async def vulnerable_config(x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
         require_user(x_lab_user)
@@ -103,19 +124,22 @@ def create_benchmark_lab() -> FastAPI:
 
 def benchmark_profile(program_id: str) -> TargetProfile:
     operations = [
-        {"path": "/api/documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document by identifier.", "control_target": "lab://benchmark/api/documents/doc-a", "test_target": "lab://benchmark/api/documents/doc-a", "control_account": "account_a", "test_account": "account_b", "resource_key": "doc-a"},
-        {"path": "/api/secure-documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve an ownership-checked document.", "control_target": "lab://benchmark/api/secure-documents/doc-a", "test_target": "lab://benchmark/api/secure-documents/doc-a", "control_account": "account_a", "test_account": "account_b", "resource_key": "secure-doc-a"},
-        {"path": "/api/config", "method": "GET", "kind": "information", "description": "Return environment configuration for authenticated users.", "control_target": "lab://benchmark/api/config", "test_target": "lab://benchmark/api/config", "control_account": "account_a", "test_account": "account_b", "resource_key": "config"},
-        {"path": "/api/secure-config", "method": "GET", "kind": "information", "description": "Return public environment information.", "control_target": "lab://benchmark/api/secure-config", "test_target": "lab://benchmark/api/secure-config", "control_account": "account_a", "test_account": "account_b", "resource_key": "secure-config"},
-        {"path": "/api/rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a one-time reward code.", "control_target": "lab://benchmark/api/rewards/redeem", "test_target": "lab://benchmark/api/rewards/redeem", "control_account": "account_a", "test_account": "account_a", "resource_key": "reward", "test_action": "WRITE_TEST_DATA", "control_status": 200, "test_status": 409, "repeat": True},
-        {"path": "/api/secure-rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a state-checked one-time reward code.", "control_target": "lab://benchmark/api/secure-rewards/redeem", "test_target": "lab://benchmark/api/secure-rewards/redeem", "control_account": "account_a", "test_account": "account_a", "resource_key": "secure-reward", "test_action": "WRITE_TEST_DATA", "control_status": 200, "test_status": 409, "repeat": True},
+        {"path": "/api/documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document by identifier."},
+        {"path": "/api/secure-documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document with an ownership control."},
+        {"path": "/api/config", "method": "GET", "kind": "information", "description": "Return environment configuration for authenticated users."},
+        {"path": "/api/secure-config", "method": "GET", "kind": "information", "description": "Return environment information intended for callers."},
+        {"path": "/api/rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a one-time reward code."},
+        {"path": "/api/secure-rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a reward code with state handling."},
+        {"path": "/api/public-profiles/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a public profile by identifier."},
+        {"path": "/api/shared-documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document shared with the caller."},
+        {"path": "/api/resource-metadata/{id}", "method": "GET", "kind": "information", "description": "Retrieve non-sensitive metadata for a resource."},
     ]
     return TargetProfile(
         program_id=program_id,
         asset="lab://benchmark",
         category="mixed",
         features=["authorization", "information", "business"],
-        public_brief="A local API exposes document retrieval, environment information, and one-time reward operations. Test accounts are researcher-owned. Determine whether the documented security boundaries hold.",
+        public_brief="A local API exposes document retrieval, environment information, one-time reward operations, public profiles, shared documents, and resource metadata. Test accounts are researcher-owned. Determine whether the documented security boundaries hold.",
         api_spec={"operations": operations},
         test_accounts=["account_a", "account_b"],
         constraints=["Use only local lab targets.", "Do not infer a vulnerability from a status code alone.", "Compare control and test observations."],

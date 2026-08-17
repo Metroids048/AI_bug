@@ -33,11 +33,19 @@ from .storage import Repository
 def _provider_context(profile: TargetProfile | None) -> dict[str, Any]:
     if profile is None:
         return {}
+    public_operations = [
+        {
+            key: operation[key]
+            for key in ("path", "method", "kind", "description")
+            if key in operation
+        }
+        for operation in profile.api_spec.get("operations", [])
+    ]
     return {
         "target_profile_id": profile.id,
         "public_brief": profile.public_brief,
-        "api_spec": profile.api_spec,
-        "operations": profile.api_spec.get("operations", []),
+        "api_spec": {"operations": public_operations},
+        "operations": public_operations,
         "test_accounts": profile.test_accounts,
         "constraints": profile.constraints,
     }
@@ -47,6 +55,7 @@ def _provider_context(profile: TargetProfile | None) -> dict[str, Any]:
 class Planner:
     repository: Repository
     provider: Provider
+    experiment_run_id: str | None = None
 
     def plan(self, program: Program, asset: str, target_profile: TargetProfile | None = None) -> list[Hypothesis]:
         if target_profile:
@@ -56,6 +65,7 @@ class Planner:
         record_usage(
             self.repository, result.provider, result.model, "planner", result.usage,
             result.input_price_per_million, result.output_price_per_million, program_id=program.id,
+            experiment_run_id=self.experiment_run_id,
         )
         hypotheses = result.data.hypotheses
         if not 5 <= len(hypotheses) <= 20:
@@ -74,6 +84,7 @@ class Planner:
                 self.repository, plan_result.provider, plan_result.model, "validator-planner",
                 plan_result.usage, plan_result.input_price_per_million,
                 plan_result.output_price_per_million, program_id=program.id,
+                experiment_run_id=self.experiment_run_id,
             )
             validation_plan = plan_result.data
             hypothesis.validation_plan_id = validation_plan.id
@@ -83,10 +94,11 @@ class Planner:
 
 
 class JudgeService:
-    def __init__(self, repository: Repository, provider: Provider, skeptic_threshold: float = 0.7):
+    def __init__(self, repository: Repository, provider: Provider, skeptic_threshold: float = 0.7, experiment_run_id: str | None = None):
         self.repository = repository
         self.provider = provider
         self.skeptic_threshold = skeptic_threshold
+        self.experiment_run_id = experiment_run_id
 
     def review(self, finding: Finding) -> JudgeResult:
         validations = [
@@ -112,16 +124,26 @@ class JudgeService:
         evidence_passed = len(evidences) >= 2 and all(item.complete and item.redacted for item in evidences)
         boundary_passed = bool(finding.security_boundary)
         impact_context = {
-            "security_boundary_broken": reproducibility_passed and bool(finding.observed_impact),
             "expected_behavior": finding.expected_behavior,
             "actual_behavior": finding.actual_behavior,
             "observed_impact": finding.observed_impact,
+            "evidence": [
+                {
+                    "phase": (self.repository.get("observation", item.observation_id, Observation).phase
+                               if self.repository.get("observation", item.observation_id, Observation) else "UNKNOWN"),
+                    "request": item.request,
+                    "response": item.response,
+                    "expected_behavior": item.expected_behavior,
+                    "actual_behavior": item.actual_behavior,
+                }
+                for item in evidences
+            ],
         }
         skeptic_result = self.provider.skeptic(impact_context)
         record_usage(
             self.repository, skeptic_result.provider, skeptic_result.model, "skeptic", skeptic_result.usage,
             skeptic_result.input_price_per_million, skeptic_result.output_price_per_million,
-            finding_id=finding.id,
+            finding_id=finding.id, experiment_run_id=self.experiment_run_id,
         )
         skeptic_data: SkepticResult = skeptic_result.data
         skeptic_passed = (
@@ -133,7 +155,7 @@ class JudgeService:
         record_usage(
             self.repository, impact_result.provider, impact_result.model, "impact-reviewer", impact_result.usage,
             impact_result.input_price_per_million, impact_result.output_price_per_million,
-            finding_id=finding.id,
+            finding_id=finding.id, experiment_run_id=self.experiment_run_id,
         )
         impact_data: ImpactReviewResult = impact_result.data
         impact_passed = bool(impact_data.passed and impact_data.observed_impact)
@@ -162,13 +184,14 @@ class JudgeService:
 
 
 class ResearchOrchestrator:
-    def __init__(self, repository: Repository, provider: Provider, executor: LocalLabExecutor | None = None):
+    def __init__(self, repository: Repository, provider: Provider, executor: LocalLabExecutor | None = None, experiment_run_id: str | None = None):
         self.repository = repository
         self.provider = provider
+        self.experiment_run_id = experiment_run_id
         self.guard = ScopeGuard(repository)
         self.evidence = EvidenceStore(repository)
         self.executor = executor or LocalLabExecutor()
-        self.judge = JudgeService(repository, provider)
+        self.judge = JudgeService(repository, provider, experiment_run_id=experiment_run_id)
 
     def run(self, program: Program, hypothesis: Hypothesis, target_profile: TargetProfile | None = None) -> Finding:
         if hypothesis.state != ResearchState.HYPOTHESIS:
@@ -321,7 +344,7 @@ def _protected_data(body: Any) -> bool:
         return False
     for key, value in body.items():
         key_lower = str(key).lower()
-        if any(marker in key_lower for marker in ("private", "internal", "secret", "token", "email")):
+        if any(marker in key_lower for marker in ("private", "secret", "token", "email")):
             return True
         if isinstance(value, dict) and _protected_data(value):
             return True

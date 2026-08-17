@@ -17,7 +17,7 @@
 
 ## Verification Result (2026-08-18)
 
-- `agent-python -m pytest -q`: **17 passed**。
+- `agent-python -m pytest -q`: **18 passed**。
 - `agent-python -m ruff check src tests`: **All checks passed**。
 - `agent-python -m compileall -q src tests`: **PASS**。
 - `git diff --check`: **PASS**（仅有 Git 的 LF/CRLF 提示）。
@@ -25,3 +25,10 @@
 - CLI Bounty Ledger: `PAID` reward 125 后 `booked_revenue=125`、`paid_revenue=125`、`net_profit=125`。
 - Report export and `audit-replay` completed from a fresh SQLite database。
 - No live target, platform submission, or real model endpoint was called。
+
+## M2.6 Offline Experiment Result
+
+- Fresh CLI run: `3 rounds × 9 scenarios = 27 case-runs`。
+- `TP=9`、`FP=0`、`FN=0`、`Precision=1.0`、`Recall=1.0`、`Scope Violation=0`。
+- Reproduction failures `0`、Evidence failures `0`、Gate `PASS`。
+- This result uses the deterministic `blind` surrogate; **Real-Model Gate remains NOT VERIFIED** until an explicitly configured OpenAI-compatible endpoint is run.
