@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 
-from .domain import ActionProposal, Observation
+from .domain import ActionProposal, Observation, TargetProfile
+
+ACCOUNT_USERS = {"account_a": "alice", "account_b": "bob"}
+
+
+def _attach_reset(app: FastAPI, reset) -> FastAPI:
+    app.state.reset_fixture = reset
+    return app
 
 
 def create_idor_lab() -> FastAPI:
@@ -23,7 +30,6 @@ def create_idor_lab() -> FastAPI:
             raise HTTPException(status_code=404, detail="document not found")
         if not x_lab_user:
             raise HTTPException(status_code=401, detail="authentication required")
-        # Intentionally vulnerable local fixture: it omits the ownership check.
         return documents[document_id]
 
     @app.get("/api/profile/{user_id}")
@@ -34,7 +40,86 @@ def create_idor_lab() -> FastAPI:
             raise HTTPException(status_code=403, detail="forbidden")
         return {"user_id": user_id, "display_name": user_id.title()}
 
-    return app
+    return _attach_reset(app, lambda: None)
+
+
+def create_benchmark_lab() -> FastAPI:
+    app = FastAPI(title="Blind Offline Security Benchmark")
+    redeemed: set[tuple[str, str]] = set()
+
+    def reset() -> None:
+        redeemed.clear()
+
+    def require_user(user: str | None) -> str:
+        if not user:
+            raise HTTPException(status_code=401, detail="authentication required")
+        return user
+
+    @app.get("/api/documents/{document_id}")
+    async def vulnerable_idor(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        user = require_user(x_lab_user)
+        if document_id != "doc-a":
+            raise HTTPException(status_code=404, detail="document not found")
+        return {"id": document_id, "owner_id": "alice", "owner_email": "alice@example.test", "private_note": "benchmark private note", "viewer": user}
+
+    @app.get("/api/secure-documents/{document_id}")
+    async def secure_idor(document_id: str, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        user = require_user(x_lab_user)
+        if document_id != "doc-a":
+            raise HTTPException(status_code=404, detail="document not found")
+        if user != "alice":
+            raise HTTPException(status_code=403, detail="forbidden")
+        return {"id": document_id, "owner_id": "alice", "private_note": "benchmark private note", "viewer": user}
+
+    @app.get("/api/config")
+    async def vulnerable_config(x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user(x_lab_user)
+        return {"environment": "benchmark", "internal_email": "ops@example.test", "internal_host": "db.internal"}
+
+    @app.get("/api/secure-config")
+    async def secure_config(x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user(x_lab_user)
+        return {"environment": "benchmark"}
+
+    @app.post("/api/rewards/redeem")
+    async def vulnerable_reward(request: Request, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        user = require_user(x_lab_user)
+        payload = await request.json()
+        return {"redeemed": True, "code": payload.get("code", "WELCOME"), "discount": 20, "user": user}
+
+    @app.post("/api/secure-rewards/redeem")
+    async def secure_reward(request: Request, x_lab_user: str | None = Header(default=None)) -> dict[str, Any]:
+        user = require_user(x_lab_user)
+        payload = await request.json()
+        code = str(payload.get("code", "WELCOME"))
+        key = (user, code)
+        if key in redeemed:
+            raise HTTPException(status_code=409, detail="reward already redeemed")
+        redeemed.add(key)
+        return {"redeemed": True, "code": code, "discount": 20, "user": user}
+
+    return _attach_reset(app, reset)
+
+
+def benchmark_profile(program_id: str) -> TargetProfile:
+    operations = [
+        {"path": "/api/documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve a document by identifier.", "control_target": "lab://benchmark/api/documents/doc-a", "test_target": "lab://benchmark/api/documents/doc-a", "control_account": "account_a", "test_account": "account_b", "resource_key": "doc-a"},
+        {"path": "/api/secure-documents/{id}", "method": "GET", "kind": "authorization", "description": "Retrieve an ownership-checked document.", "control_target": "lab://benchmark/api/secure-documents/doc-a", "test_target": "lab://benchmark/api/secure-documents/doc-a", "control_account": "account_a", "test_account": "account_b", "resource_key": "secure-doc-a"},
+        {"path": "/api/config", "method": "GET", "kind": "information", "description": "Return environment configuration for authenticated users.", "control_target": "lab://benchmark/api/config", "test_target": "lab://benchmark/api/config", "control_account": "account_a", "test_account": "account_b", "resource_key": "config"},
+        {"path": "/api/secure-config", "method": "GET", "kind": "information", "description": "Return public environment information.", "control_target": "lab://benchmark/api/secure-config", "test_target": "lab://benchmark/api/secure-config", "control_account": "account_a", "test_account": "account_b", "resource_key": "secure-config"},
+        {"path": "/api/rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a one-time reward code.", "control_target": "lab://benchmark/api/rewards/redeem", "test_target": "lab://benchmark/api/rewards/redeem", "control_account": "account_a", "test_account": "account_a", "resource_key": "reward", "test_action": "WRITE_TEST_DATA", "control_status": 200, "test_status": 409, "repeat": True},
+        {"path": "/api/secure-rewards/redeem", "method": "POST", "kind": "business", "description": "Redeem a state-checked one-time reward code.", "control_target": "lab://benchmark/api/secure-rewards/redeem", "test_target": "lab://benchmark/api/secure-rewards/redeem", "control_account": "account_a", "test_account": "account_a", "resource_key": "secure-reward", "test_action": "WRITE_TEST_DATA", "control_status": 200, "test_status": 409, "repeat": True},
+    ]
+    return TargetProfile(
+        program_id=program_id,
+        asset="lab://benchmark",
+        category="mixed",
+        features=["authorization", "information", "business"],
+        public_brief="A local API exposes document retrieval, environment information, and one-time reward operations. Test accounts are researcher-owned. Determine whether the documented security boundaries hold.",
+        api_spec={"operations": operations},
+        test_accounts=["account_a", "account_b"],
+        constraints=["Use only local lab targets.", "Do not infer a vulnerability from a status code alone.", "Compare control and test observations."],
+    )
 
 
 class LiveTargetBlocked(RuntimeError):
@@ -44,30 +129,41 @@ class LiveTargetBlocked(RuntimeError):
 class LocalLabExecutor:
     """Only executes lab:// targets through an in-process ASGI transport."""
 
-    def __init__(self, app: FastAPI | None = None):
-        self.app = app or create_idor_lab()
+    def __init__(self, app: FastAPI | None = None, lab_name: str = "idor"):
+        self.app = app or (create_benchmark_lab() if lab_name == "benchmark" else create_idor_lab())
+
+    def reset(self) -> None:
+        reset = getattr(self.app.state, "reset_fixture", None)
+        if reset:
+            reset()
 
     def execute(self, proposal: ActionProposal) -> Observation:
         parsed = urlsplit(proposal.target)
-        if parsed.scheme != "lab" or parsed.netloc != "idor":
-            raise LiveTargetBlocked("M2 executor refuses every non-lab target.")
-        if proposal.method.upper() != "GET":
-            raise LiveTargetBlocked("Offline lab only permits the declared read-only GET path.")
-        user = {"account_a": "alice", "account_b": "bob"}.get(proposal.account_role)
+        if parsed.scheme != "lab" or parsed.netloc not in {"idor", "benchmark"}:
+            raise LiveTargetBlocked("M2.5 executor refuses every non-lab target.")
+        if proposal.method.upper() not in {"GET", "POST"}:
+            raise LiveTargetBlocked("Offline lab only permits explicit GET or POST test steps.")
+        user = ACCOUNT_USERS.get(proposal.account_role)
         if user is None:
             raise LiveTargetBlocked("Unknown test account role.")
 
         async def request() -> httpx.Response:
             transport = httpx.ASGITransport(app=self.app)
             async with httpx.AsyncClient(transport=transport, base_url="http://offline.lab") as client:
-                return await client.get(parsed.path, headers={"X-Lab-User": user})
+                path = parsed.path
+                if proposal.request_query:
+                    path = f"{path}?{urlencode(proposal.request_query)}"
+                return await client.request(
+                    proposal.method.upper(), path,
+                    headers={"X-Lab-User": user}, json=proposal.request_payload,
+                )
 
         response = asyncio.run(request())
         try:
             body = response.json()
         except ValueError:
             body = {"text": response.text}
-        actual = f"HTTP {response.status_code}; response contains private resource data." if response.status_code == 200 else f"HTTP {response.status_code}; access denied or unavailable."
+        actual = f"HTTP {response.status_code}; response received."
         return Observation(
             hypothesis_id=proposal.hypothesis_id,
             reproduction_number=1,
@@ -76,6 +172,9 @@ class LocalLabExecutor:
             response_status=response.status_code,
             response_body=body,
             request_metadata={"method": proposal.method, "target": proposal.target, "account_role": proposal.account_role},
+            response_headers={key: value for key, value in response.headers.items() if key.lower() not in {"set-cookie"}},
+            phase=proposal.phase,
+            resource_key=proposal.resource_key,
             account_role=proposal.account_role,
             success=response.status_code < 500,
         )

@@ -68,9 +68,13 @@ class ScopeRule(StrictModel):
 
 
 class Rules(StrictModel):
-    rate_limit_per_minute: int = 30
-    automation_allowed: bool = True
-    test_account_rules: str = "Use only researcher-owned test accounts."
+    rate_limit_per_minute: int | None = None
+    automation_allowed: bool | None = None
+    cross_account_testing: bool | None = None
+    test_account_rules: str | None = None
+    out_of_scope: list[str] = Field(default_factory=list)
+    excluded_vulnerability_types: list[str] = Field(default_factory=list)
+    special_rules: list[str] = Field(default_factory=list)
     prohibited_actions: list[str] = Field(
         default_factory=lambda: [
             "DOS",
@@ -96,6 +100,8 @@ class Program(StrictModel):
     scopes: list[ScopeRule] = Field(default_factory=list)
     rules: Rules = Field(default_factory=Rules)
     reward_metadata: dict[str, Any] = Field(default_factory=dict)
+    policy_snapshot_id: str | None = None
+    policy_snapshot_hash: str | None = None
     state: ProgramState = ProgramState.REVIEW_REQUIRED
     authorization_hash: str | None = None
     authorized_at: datetime | None = None
@@ -103,9 +109,67 @@ class Program(StrictModel):
     updated_at: datetime = Field(default_factory=now_utc)
 
     def scope_hash(self) -> str:
-        payload = {"scopes": self.scopes, "rules": self.rules}
+        payload = {
+            "scopes": self.scopes,
+            "rules": self.rules,
+            "policy_snapshot_id": self.policy_snapshot_id,
+            "policy_snapshot_hash": self.policy_snapshot_hash,
+        }
         raw = json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()
+
+
+class ProgramPolicySnapshot(StrictModel):
+    id: str = Field(default_factory=new_id)
+    program_id: str
+    raw_policy: str
+    source_url: str | None = None
+    captured_at: datetime = Field(default_factory=now_utc)
+    policy_hash: str
+    parsed_scope: list[str] = Field(default_factory=list)
+    parsed_out_of_scope: list[str] = Field(default_factory=list)
+    parsed_rules: dict[str, Any] = Field(default_factory=dict)
+    human_confirmed: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        program_id: str,
+        raw_policy: str,
+        source_url: str | None,
+        parsed_scope: list[str],
+        parsed_out_of_scope: list[str],
+        parsed_rules: dict[str, Any],
+    ) -> ProgramPolicySnapshot:
+        payload = {
+            "raw_policy": raw_policy,
+            "source_url": source_url,
+            "parsed_scope": parsed_scope,
+            "parsed_out_of_scope": parsed_out_of_scope,
+            "parsed_rules": parsed_rules,
+        }
+        policy_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return cls(
+            program_id=program_id,
+            raw_policy=raw_policy,
+            source_url=source_url,
+            policy_hash=policy_hash,
+            parsed_scope=parsed_scope,
+            parsed_out_of_scope=parsed_out_of_scope,
+            parsed_rules=parsed_rules,
+        )
+
+    def content_hash(self) -> str:
+        payload = {
+            "raw_policy": self.raw_policy,
+            "source_url": self.source_url,
+            "parsed_scope": self.parsed_scope,
+            "parsed_out_of_scope": self.parsed_out_of_scope,
+            "parsed_rules": self.parsed_rules,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 class TargetProfile(StrictModel):
@@ -114,12 +178,17 @@ class TargetProfile(StrictModel):
     asset: str
     category: str
     features: list[str] = Field(default_factory=list)
+    public_brief: str = ""
+    api_spec: dict[str, Any] = Field(default_factory=dict)
+    test_accounts: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=now_utc)
 
 
 class Hypothesis(StrictModel):
     id: str = Field(default_factory=new_id)
     program_id: str
+    target_profile_id: str | None = None
     category: str
     asset: str
     feature: str
@@ -136,6 +205,8 @@ class Hypothesis(StrictModel):
     scope_confidence: float = Field(default=1.0, ge=0)
     duplicate_risk: float = Field(default=0.1, gt=0)
     rank_score: float = 0.0
+    validation_plan_id: str | None = None
+    source: str = "provider"
     state: ResearchState = ResearchState.HYPOTHESIS
     created_at: datetime = Field(default_factory=now_utc)
 
@@ -152,6 +223,12 @@ class ActionProposal(StrictModel):
     account_role: str
     request_count: int = 1
     expected_behavior: str
+    phase: str = "TEST"
+    resource_key: str | None = None
+    request_query: dict[str, Any] = Field(default_factory=dict)
+    request_payload: dict[str, Any] | None = None
+    expected_status: int | None = None
+    observation_assertion: str = ""
     created_at: datetime = Field(default_factory=now_utc)
 
 
@@ -177,6 +254,9 @@ class Observation(StrictModel):
     response_status: int
     response_body: dict[str, Any] = Field(default_factory=dict)
     request_metadata: dict[str, Any] = Field(default_factory=dict)
+    response_headers: dict[str, Any] = Field(default_factory=dict)
+    phase: str = "TEST"
+    resource_key: str | None = None
     account_role: str
     success: bool
     created_at: datetime = Field(default_factory=now_utc)
@@ -196,6 +276,7 @@ class Evidence(StrictModel):
     redacted: bool = False
     complete: bool = False
     redaction_status: str = "PENDING"
+    identity_labels: dict[str, str] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=now_utc)
 
 
@@ -203,7 +284,9 @@ class ValidationResult(StrictModel):
     id: str = Field(default_factory=new_id)
     hypothesis_id: str
     observation_id: str
-    evidence_id: str
+    evidence_id: str | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+    validation_plan_id: str | None = None
     reproduction_number: int
     passed: bool
     reason: str
@@ -221,6 +304,8 @@ class JudgeResult(StrictModel):
     impact_passed: bool
     skeptic_passed: bool
     report_quality_passed: bool
+    impact_reviewer_passed: bool = True
+    skeptic_confidence: float = 0.0
     counterarguments: list[str] = Field(default_factory=list)
     reason: str
     created_at: datetime = Field(default_factory=now_utc)
@@ -242,6 +327,7 @@ class Finding(StrictModel):
     evidence_ids: list[str] = Field(default_factory=list)
     validation_result_ids: list[str] = Field(default_factory=list)
     judge_result_id: str | None = None
+    platform_result_id: str | None = None
     state: ResearchState = ResearchState.TESTING
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
@@ -272,6 +358,64 @@ class CostEntry(StrictModel):
     created_at: datetime = Field(default_factory=now_utc)
 
 
+class ValidationStep(StrictModel):
+    id: str = Field(default_factory=new_id)
+    phase: str
+    target: str
+    method: str
+    action: str
+    account_role: str
+    resource_key: str
+    expected_behavior: str
+    expected_status: int | None = None
+    request_query: dict[str, Any] = Field(default_factory=dict)
+    request_payload: dict[str, Any] | None = None
+    observation_assertion: str = ""
+
+
+class ValidationPlan(StrictModel):
+    id: str = Field(default_factory=new_id)
+    hypothesis_id: str
+    objective: str
+    steps: list[ValidationStep] = Field(min_length=2)
+    required_accounts: list[str] = Field(default_factory=list)
+    stop_conditions: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class ImpactReview(StrictModel):
+    observed_impact: str
+    potential_impact: str
+    passed: bool
+    confidence: float = Field(ge=0, le=1)
+
+
+class PlatformResultStatus(str, Enum):
+    SUBMITTED = "SUBMITTED"
+    VALID = "VALID"
+    DUPLICATE = "DUPLICATE"
+    INFORMATIVE = "INFORMATIVE"
+    N_A = "N/A"
+    INVALID = "INVALID"
+    PAID = "PAID"
+
+
+class PlatformResult(StrictModel):
+    id: str = Field(default_factory=new_id)
+    finding_id: str
+    program_id: str
+    submission_id: str
+    status: PlatformResultStatus
+    severity: str | None = None
+    reward: float = 0.0
+    currency: str = "USD"
+    feedback: str | None = None
+    submitted_at: datetime | None = None
+    triaged_at: datetime | None = None
+    paid_at: datetime | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+
+
 class AuditEvent(StrictModel):
     id: int | None = None
     event_type: str
@@ -288,6 +432,13 @@ class HypothesisBatch(StrictModel):
 class SkepticResult(StrictModel):
     supports_finding: bool
     counterarguments: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+
+
+class ImpactReviewResult(StrictModel):
+    observed_impact: str
+    potential_impact: str
+    passed: bool
     confidence: float = Field(ge=0, le=1)
 
 

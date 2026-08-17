@@ -1,8 +1,8 @@
 # AI Bug Bounty Researcher
 
-这是一个安全优先的离线 MVP，用于验证“AI 研究假设 + 客观验证证据 + 对抗审查”是否能形成可回放的研究闭环。
+这是一个安全优先的离线 M2.5，用于验证“真实模型研究 + 客观验证证据 + 对抗审查”是否能形成可回放的研究闭环。
 
-本轮只运行进程内 `lab://idor` 靶场。任何 `http://`、`https://` 或未知目标都会被执行器拒绝；系统不会扫描真实网站，也不会自动提交平台报告。
+当前 Benchmark 运行进程内 `lab://benchmark` 靶场，包含 IDOR、信息泄露和业务状态的易受攻击/安全对照。任何 `http://`、`https://` 或未知目标都会被执行器拒绝；系统不会扫描真实网站，也不会自动提交平台报告。
 
 ## Setup
 
@@ -15,20 +15,23 @@ agent-python -m pip install -e ".[dev]"
 ## Offline happy path
 
 ```powershell
-abb demo-create --db data/demo.sqlite3
-abb authorize <PROGRAM_ID> <SCOPE_HASH> --db data/demo.sqlite3
-abb plan <PROGRAM_ID> --db data/demo.sqlite3
-abb run <PROGRAM_ID> --limit 2 --db data/demo.sqlite3
-abb report <SUBMISSION_READY_FINDING_ID> --db data/demo.sqlite3
-abb roi --db data/demo.sqlite3
-abb audit-replay --db data/demo.sqlite3
+abb benchmark-create --db data/benchmark.sqlite3
+abb authorize <PROGRAM_ID> <SCOPE_HASH> --db data/benchmark.sqlite3
+abb plan <PROGRAM_ID> --provider blind --db data/benchmark.sqlite3
+abb run <PROGRAM_ID> --provider blind --limit 6 --db data/benchmark.sqlite3
+abb report <SUBMISSION_READY_FINDING_ID> --db data/benchmark.sqlite3
+abb platform-result <FINDING_ID> <PROGRAM_ID> <SUBMISSION_ID> --status PAID --reward 125 --db data/benchmark.sqlite3
+abb roi --db data/benchmark.sqlite3
+abb audit-replay --db data/benchmark.sqlite3
 ```
 
-`demo-create` 只创建 `REVIEW_REQUIRED` Program。必须人工确认 Scope 哈希后才能授权。
+`benchmark-create` 只创建 `REVIEW_REQUIRED` Program。必须人工确认 Scope 哈希后才能授权。`program-create` 对自动化、跨账户测试、速率和测试账户规则默认保存为 `UNKNOWN`；任何 UNKNOWN 都不能授权。
 
 ## Optional model endpoint
 
-默认使用离线确定性 Provider。OpenAI-compatible 适配器支持 DeepSeek、CC Switch 或其他兼容中转，但必须显式启用模型网络；密钥只通过环境变量提供，不会持久化。真实模型 smoke test 不是自动验收的一部分。
+真实 Research 通过 `--provider openai-compatible` 接入 DeepSeek、CC Switch 或其他兼容中转；必须显式设置 `ABB_LLM_NETWORK_ENABLED=true`、`ABB_LLM_API_KEY`、`ABB_LLM_BASE_URL`、`ABB_LLM_MODEL` 和价格环境变量。`blind` Provider 只用于离线 Benchmark 回归，不代表真实 AI 发现能力。
+
+Program Policy Snapshot 保存原始规则、来源 URL、采集时间、Policy Hash、解析 Scope/Out-of-Scope 和规则快照。Scope Matcher 支持 scheme、host、port、显式 host/path wildcard，并且 Out-of-Scope 优先级高于 In-Scope。
 
 ## Verification
 

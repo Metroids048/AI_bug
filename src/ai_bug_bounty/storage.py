@@ -8,7 +8,16 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from .domain import AuditEvent, CostEntry, Program, ProgramState, _jsonable, now_utc
+from .domain import (
+    AuditEvent,
+    CostEntry,
+    PlatformResult,
+    PlatformResultStatus,
+    Program,
+    ProgramState,
+    _jsonable,
+    now_utc,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -155,6 +164,52 @@ class Repository:
             (program_id,) if program_id else (),
         ).fetchone()[0]
         return {"entries": row["count"], "known_total": row["total"] or 0.0, "unknown_entries": unknown}
+
+    def roi_summary(self, program_id: str | None = None) -> dict[str, Any]:
+        cost = self.cost_summary(program_id)
+        if program_id:
+            rows = self.connection.execute(
+                "SELECT payload_json FROM entities WHERE entity_type = 'platform_result' AND program_id = ?",
+                (program_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT payload_json FROM entities WHERE entity_type = 'platform_result'"
+            ).fetchall()
+        results = [PlatformResult.model_validate(json.loads(row["payload_json"])) for row in rows]
+        booked_revenue = sum(
+            result.reward for result in results
+            if result.status in {PlatformResultStatus.VALID, PlatformResultStatus.PAID}
+        )
+        paid_revenue = sum(result.reward for result in results if result.status == PlatformResultStatus.PAID)
+        model_cost = 0.0
+        infrastructure_cost = 0.0
+        for row in self.connection.execute(
+            "SELECT task, estimated_cost FROM cost_entries WHERE estimated_cost IS NOT NULL"
+            + (" AND program_id = ?" if program_id else ""),
+            (program_id,) if program_id else (),
+        ).fetchall():
+            if str(row["task"]).startswith("infra:"):
+                infrastructure_cost += row["estimated_cost"] or 0.0
+            else:
+                model_cost += row["estimated_cost"] or 0.0
+        total_cost = model_cost + infrastructure_cost
+        net_profit = paid_revenue - total_cost
+        return {
+            "total_cost": total_cost,
+            "model_cost": model_cost,
+            "infrastructure_cost": infrastructure_cost,
+            "booked_revenue": booked_revenue,
+            "paid_revenue": paid_revenue,
+            "net_profit": net_profit,
+            "roi": (net_profit / total_cost) if total_cost else None,
+            "submissions": len(results),
+            "valid": sum(result.status in {PlatformResultStatus.VALID, PlatformResultStatus.PAID} for result in results),
+            "duplicate": sum(result.status == PlatformResultStatus.DUPLICATE for result in results),
+            "informative": sum(result.status == PlatformResultStatus.INFORMATIVE for result in results),
+            "invalid": sum(result.status == PlatformResultStatus.INVALID for result in results),
+            "unknown_cost_entries": cost["unknown_entries"],
+        }
 
     def audit(self, event_type: str, entity_type: str, entity_id: str, data: dict[str, Any]) -> AuditEvent:
         with self.transaction() as conn:

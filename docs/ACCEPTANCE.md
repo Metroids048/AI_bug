@@ -9,12 +9,19 @@
 - 正确鉴权负向对照进入 `INVALID`，不能生成报告。
 - Evidence、日志和导出报告不包含测试 Token、Cookie、邮箱或 API Key 原值。
 - socket 拦截证明离线流程没有互联网请求。
+- Scope Matcher 对 path/port/explicit wildcard 正确匹配，Out-of-Scope 优先拒绝。
+- UNKNOWN automation/cross-account/rate/test-account policy 不能授权。
+- blind Benchmark 输入不包含漏洞 Oracle；易受攻击 IDOR/信息泄露/业务状态场景可进入 `SUBMISSION_READY`，三个安全对照必须 `INVALID`。
+- OpenAI-compatible provider 可显式接入真实模型，价格能传入 Cost Ledger。
+- PlatformResult 可记录 `VALID/DUPLICATE/INFORMATIVE/N/A/INVALID/PAID`，ROI 输出 Revenue、Net Profit 和 ROI。
 
-## Verification Result (2026-08-17)
+## Verification Result (2026-08-18)
 
-- `agent-python -m pytest -q`: **9 passed**。
+- `agent-python -m pytest -q`: **17 passed**。
 - `agent-python -m ruff check src tests`: **All checks passed**。
 - `agent-python -m compileall -q src tests`: **PASS**。
-- CLI E2E: `REVIEW_REQUIRED → AUTHORIZED → 5 hypotheses → 2 runs`；真 IDOR 为 `SUBMISSION_READY`，正确鉴权对照为 `INVALID`。
+- `git diff --check`: **PASS**（仅有 Git 的 LF/CRLF 提示）。
+- CLI E2E: `REVIEW_REQUIRED → AUTHORIZED → 6 blind hypotheses → 6 runs`；IDOR、信息泄露和业务逻辑正例为 `SUBMISSION_READY`，三个安全对照为 `INVALID`。
+- CLI Bounty Ledger: `PAID` reward 125 后 `booked_revenue=125`、`paid_revenue=125`、`net_profit=125`。
 - Report export and `audit-replay` completed from a fresh SQLite database。
 - No live target, platform submission, or real model endpoint was called。
