@@ -1,0 +1,11 @@
+database: data/bugbounty.sqlite3
+llm:
+  provider: deterministic
+  base_url: http://127.0.0.1:18789/v1
+  model: deepseek-chat
+  network_enabled: false
+  input_price_per_million: 0.0
+  output_price_per_million: 0.0
+safety:
+  max_actions_per_hypothesis: 3
+  max_requests_per_action: 1
