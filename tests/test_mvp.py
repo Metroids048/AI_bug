@@ -12,6 +12,7 @@ from ai_bug_bounty.domain import (
     Decision,
     Evidence,
     Finding,
+    Hypothesis,
     Observation,
     PlatformResult,
     PlatformResultStatus,
@@ -21,6 +22,8 @@ from ai_bug_bounty.domain import (
     ResearchState,
     Rules,
     ScopeRule,
+    ValidationPlan,
+    ValidationStep,
 )
 from ai_bug_bounty.evidence import EvidenceStore
 from ai_bug_bounty.experiments import ExperimentRunner
@@ -366,6 +369,216 @@ def test_m26_three_round_nine_case_metrics_and_no_oracle_context(repo, monkeypat
     assert summary["evidence_failures"] == 0
     assert summary["gate_passed"] is True
     assert summary["gate_failures"] == []
+
+
+def test_three_round_blind_and_one_round_weak_batch_are_isolated(repo, monkeypatch):
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    blind_runs = ExperimentRunner(repo, BlindBenchmarkProvider()).run(program, profile, rounds=3)
+    weak_runs = ExperimentRunner(repo, DeterministicProvider()).run(program, profile, rounds=1)
+    blind_batch = repo.get("experiment_batch", blind_runs[0].experiment_batch_id, __import__("ai_bug_bounty.domain", fromlist=["ExperimentBatch"]).ExperimentBatch)
+    weak_batch = repo.get("experiment_batch", weak_runs[0].experiment_batch_id, __import__("ai_bug_bounty.domain", fromlist=["ExperimentBatch"]).ExperimentBatch)
+    assert blind_batch and weak_batch and blind_batch.id != weak_batch.id
+    assert repo.experiment_summary(batch_id=blind_batch.id)["gate_passed"] is True
+    weak_summary = repo.experiment_summary(batch_id=weak_batch.id)
+    assert weak_summary["runs"] == 1
+    assert weak_summary["gate_passed"] is False
+    assert "insufficient_rounds" in weak_summary["gate_failures"]
+
+
+def test_weak_three_round_batch_cannot_be_saved_by_blind_history(repo, monkeypatch):
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    ExperimentRunner(repo, BlindBenchmarkProvider()).run(program, profile, rounds=3)
+    weak_runs = ExperimentRunner(repo, DeterministicProvider()).run(program, profile, rounds=3)
+    summary = repo.experiment_summary(batch_id=weak_runs[0].experiment_batch_id)
+    assert summary["case_runs"] == 27
+    assert summary["gate_passed"] is False
+
+
+def test_program_summary_requires_explicit_batch_when_multiple_exist(repo):
+    from ai_bug_bounty.domain import ExperimentBatch, ExperimentBatchStatus
+    for provider in ("blind-benchmark", "other"):
+        repo.save("experiment_batch", ExperimentBatch(program_id="p", provider=provider, model="m", benchmark_version="v", requested_rounds=3, run_ids=[], status=ExperimentBatchStatus.COMPLETED), "p")
+    with pytest.raises(ValueError, match="batch_id"):
+        repo.experiment_summary(program_id="p")
+
+
+def test_legacy_unbatched_runs_are_readable_but_not_gate_eligible(repo):
+    from ai_bug_bounty.domain import ExperimentRun
+    run = ExperimentRun(program_id="p", provider="legacy", model="m", round_number=1, context_hash="h", total_cases=0)
+    repo.save("experiment_run", run, "p")
+    summary = repo.experiment_summary(program_id="p")
+    assert summary["runs"] == 1
+    assert summary["gate_passed"] is False
+    assert "legacy_unbatched" in summary["gate_failures"]
+
+
+def test_experiment_list_reports_independent_batches(repo):
+    from ai_bug_bounty.domain import ExperimentBatch
+    first = ExperimentBatch(program_id="p", provider="blind", model="m1", benchmark_version="v1", requested_rounds=3, run_ids=[])
+    second = ExperimentBatch(program_id="p", provider="weak", model="m2", benchmark_version="v1", requested_rounds=1, run_ids=[])
+    repo.save("experiment_batch", first, "p")
+    repo.save("experiment_batch", second, "p")
+    batches = repo.experiment_list("p")
+    assert [item.id for item in batches] == [first.id, second.id]
+
+
+def test_benchmark_version_is_stable_for_same_contract():
+    from ai_bug_bounty.experiments import benchmark_version
+    assert benchmark_version() == benchmark_version()
+
+
+def _benchmark_hypothesis(program_id: str, method: str = "GET", path: str = "/api/documents/{id}"):
+    return Hypothesis(
+        program_id=program_id, asset="lab://benchmark", category="authorization", feature="human text that is not an identity",
+        operation_method=method, operation_path=path,
+        expected_security_boundary="Account B must not read Account A private document.",
+        hypothesis="The operation may cross a boundary.", reason="test", validation_plan="control and test",
+        required_accounts=["account_a", "account_b"], confidence=0.8,
+    )
+
+
+def _benchmark_plan(hypothesis_id: str, target: str = "lab://benchmark/api/documents/doc-a", phases=("CONTROL", "TEST")):
+    return ValidationPlan(
+        hypothesis_id=hypothesis_id, objective="test", steps=[
+            ValidationStep(phase=phases[0], target=target, method="GET", action="READ", account_role="account_a", resource_key="document_a", expected_behavior="control"),
+            ValidationStep(phase=phases[1], target=target, method="GET", action="READ_OTHER_TEST_ACCOUNT_DATA", account_role="account_b", resource_key="document_a", expected_behavior="test"),
+        ],
+    )
+
+
+def test_feature_text_is_not_used_as_machine_operation_identity():
+    from ai_bug_bounty.workflow import validate_benchmark_plan
+    hypothesis = _benchmark_hypothesis("p")
+    hypothesis.feature = "GET lab://benchmark/api/environment"
+    assert validate_benchmark_plan(hypothesis, _benchmark_plan(hypothesis.id), benchmark_profile("p")) is None
+
+
+def test_documents_hypothesis_cannot_score_environment_execution():
+    from ai_bug_bounty.workflow import validate_benchmark_plan
+    hypothesis = _benchmark_hypothesis("p")
+    plan = _benchmark_plan(hypothesis.id, "lab://benchmark/api/environment")
+    assert validate_benchmark_plan(hypothesis, plan, benchmark_profile("p")) == "SCENARIO_MISMATCH"
+
+
+def test_missing_control_is_contract_failure_before_execution():
+    from ai_bug_bounty.workflow import validate_benchmark_plan
+    hypothesis = _benchmark_hypothesis("p")
+    plan = _benchmark_plan(hypothesis.id, phases=("TEST", "TEST"))
+    assert validate_benchmark_plan(hypothesis, plan, benchmark_profile("p")) == "MISSING_CONTROL"
+
+
+def test_missing_test_is_contract_failure_before_execution():
+    from ai_bug_bounty.workflow import validate_benchmark_plan
+    hypothesis = _benchmark_hypothesis("p")
+    plan = _benchmark_plan(hypothesis.id, phases=("CONTROL", "CONTROL"))
+    assert validate_benchmark_plan(hypothesis, plan, benchmark_profile("p")) == "MISSING_TEST"
+
+
+def test_multi_operation_plan_is_contract_failure():
+    from ai_bug_bounty.workflow import validate_benchmark_plan
+    hypothesis = _benchmark_hypothesis("p")
+    plan = ValidationPlan(hypothesis_id=hypothesis.id, objective="test", steps=[
+        _benchmark_plan(hypothesis.id).steps[0],
+        ValidationStep(phase="TEST", target="lab://benchmark/api/environment", method="GET", action="READ", account_role="account_b", resource_key="environment", expected_behavior="test"),
+    ])
+    assert validate_benchmark_plan(hypothesis, plan, benchmark_profile("p")) == "MULTI_OPERATION_PLAN"
+
+
+def test_validation_plan_hypothesis_id_mismatch_is_rejected():
+    from ai_bug_bounty.workflow import validate_benchmark_plan
+    hypothesis = _benchmark_hypothesis("p")
+    assert validate_benchmark_plan(hypothesis, _benchmark_plan("other"), benchmark_profile("p")) == "VALIDATION_PLAN_HYPOTHESIS_MISMATCH"
+
+
+def test_openai_benchmark_schema_requires_operation_method_and_path():
+    from ai_bug_bounty.providers import BenchmarkHypothesisBatch
+    schema = BenchmarkHypothesisBatch.model_json_schema()
+    item = schema["$defs"]["BenchmarkHypothesis"]
+    assert "operation_method" in item["required"]
+    assert "operation_path" in item["required"]
+
+
+def test_executed_targets_match_declared_operation_for_valid_case(repo, monkeypatch):
+    from ai_bug_bounty.workflow import resolve_benchmark_operation
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    ExperimentRunner(repo, BlindBenchmarkProvider()).run(program, profile, rounds=1)
+    cases = repo.list("experiment_case_result", __import__("ai_bug_bounty.domain", fromlist=["ExperimentCaseResult"]).ExperimentCaseResult, program.id)
+    valid = [item for item in cases if item.contract_valid]
+    assert valid
+    assert all(
+        item.executed_targets
+        and item.executed_methods
+        and resolve_benchmark_operation(item.executed_methods[0], item.executed_targets[0], profile.api_spec["operations"])["path"] == item.declared_operation_path
+        for item in valid
+    )
+
+
+def test_scenario_mismatch_active_chain_documents_hypothesis_cannot_score_environment(repo, monkeypatch):
+    class ScenarioMismatchProvider(BlindBenchmarkProvider):
+        def validation_plan(self, hypothesis, context):
+            result = super().validation_plan(hypothesis, context)
+            if hypothesis.operation_path == "/api/documents/{id}":
+                result.data.steps[0].target = "lab://benchmark/api/environment"
+                result.data.steps[1].target = "lab://benchmark/api/environment"
+            return result
+
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    runs = ExperimentRunner(repo, ScenarioMismatchProvider()).run(program, profile, rounds=1)
+    cases = repo.list("experiment_case_result", __import__("ai_bug_bounty.domain", fromlist=["ExperimentCaseResult"]).ExperimentCaseResult, program.id)
+    documents = next(item for item in cases if item.scenario_key == "/api/documents/{id}")
+    summary = repo.experiment_summary(batch_id=runs[0].experiment_batch_id)
+    assert documents.true_positive is False
+    assert documents.contract_valid is False
+    assert documents.contract_reason_code == "SCENARIO_MISMATCH"
+    assert documents.executed_targets == []
+    assert summary["gate_passed"] is False
+
+
+def _fresh_benchmark_finding(repo, monkeypatch, scenario_path: str):
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    ExperimentRunner(repo, BlindBenchmarkProvider()).run(program, profile, rounds=1)
+    cases = repo.list("experiment_case_result", __import__("ai_bug_bounty.domain", fromlist=["ExperimentCaseResult"]).ExperimentCaseResult, program.id)
+    case = next(item for item in cases if item.scenario_key == scenario_path)
+    return repo.get("finding", case.finding_id, Finding)
+
+
+def test_authorization_report_steps_come_from_validation_plan(repo, monkeypatch):
+    finding = _fresh_benchmark_finding(repo, monkeypatch, "/api/documents/{id}")
+    draft = ReportService(repo).generate(finding)
+    assert "CONTROL" in draft.markdown and "TEST" in draft.markdown
+    assert "lab://benchmark/api/documents/doc-a" in draft.markdown
+    assert "two researcher-owned test accounts" not in draft.markdown
+
+
+def test_information_report_does_not_use_idor_template(repo, monkeypatch):
+    finding = _fresh_benchmark_finding(repo, monkeypatch, "/api/environment")
+    draft = ReportService(repo).generate(finding)
+    assert "lab://benchmark/api/environment" in draft.markdown
+    assert "Account A document identifier" not in draft.markdown
+
+
+def test_business_report_does_not_use_document_template(repo, monkeypatch):
+    finding = _fresh_benchmark_finding(repo, monkeypatch, "/api/promotions/apply")
+    draft = ReportService(repo).generate(finding)
+    assert "lab://benchmark/api/promotions/apply" in draft.markdown
+    assert "Account A document identifier" not in draft.markdown
+
+
+def test_report_evidence_remains_redacted(repo, monkeypatch):
+    finding = _fresh_benchmark_finding(repo, monkeypatch, "/api/documents/{id}")
+    draft = ReportService(repo).generate(finding)
+    assert "alice@example.test" not in draft.markdown
+    assert "secret-token" not in draft.markdown
 
 
 def test_neutral_benchmark_routes_return_expected_safe_controls():

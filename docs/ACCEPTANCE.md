@@ -15,7 +15,20 @@
 - OpenAI-compatible provider 可显式接入真实模型，价格能传入 Cost Ledger。
 - PlatformResult 可记录 `VALID/DUPLICATE/INFORMATIVE/N/A/INVALID/PAID`，ROI 输出 Revenue、Net Profit 和 ROI。
 
-## Verification Result (2026-08-18, M2.6.2)
+## Verification Result (2026-08-18, M2.6.3)
+
+- M2.6.3 Gate Integrity implemented: exact ExperimentBatch isolation, structured operation/plan contract, execution target audit, and dynamic plan-derived reports.
+- `agent-python -m pytest -q`: **41 passed**。
+- `agent-python -m ruff check src tests`: **All checks passed**。
+- `agent-python -m compileall -q src tests`: **PASS**。
+- `agent-python -m pip check`: **No broken requirements found**。
+- `git diff --check`: **PASS**（仅有 Git 的 LF/CRLF 提示）。
+- Fresh offline Batch A `cff1bcd4-85a0-499e-a680-93af8520f04d`: `COMPLETED`, `runs=3`, `case_runs=27`, `TP=9`, `FP=0`, `FN=0`, `contract_failures=0`, `scope=0`, `reproduction_failures=0`, `evidence_failures=0`, `gate=true`。
+- Fresh offline Batch B `0207287b-9e78-438b-b473-d644ecb400ae`: independent `runs=1`, `case_runs=9`, `gate=false`, `insufficient_rounds`; exact batch summary did not borrow Batch A history。
+- Scenario mismatch regression: declared `GET /api/documents/{id}` with environment plan returned `SCENARIO_MISMATCH`, executed targets empty, and did not score documents TP。
+- Real-Model Gate: **NOT VERIFIED**（本轮没有配置或调用 `ABB_LLM_*` endpoint）。
+
+## Earlier Verification Result (2026-08-18, M2.6.2)
 
 - `agent-python -m pytest -q`: **22 passed**。
 - `agent-python -m ruff check src tests`: **All checks passed**。

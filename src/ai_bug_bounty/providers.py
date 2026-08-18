@@ -9,6 +9,8 @@ import httpx
 from pydantic import BaseModel
 
 from .domain import (
+    BenchmarkHypothesis,
+    BenchmarkHypothesisBatch,
     Hypothesis,
     HypothesisBatch,
     ImpactReviewResult,
@@ -73,6 +75,7 @@ class DeterministicProvider(Provider):
         candidates = [
             Hypothesis(
                 **common, feature="GET /api/documents/{id}",
+                operation_method="GET", operation_path="/api/documents/{id}",
                 expected_security_boundary="Account B must not read Account A private document.",
                 hypothesis="The document identifier may be accepted without an ownership check.",
                 reason="Object identifiers are read through an authenticated API path.",
@@ -81,6 +84,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="GET /api/profile/{user_id}",
+                operation_method="GET", operation_path="/api/profile/{user_id}",
                 expected_security_boundary="Account B must not read Account A private profile.",
                 hypothesis="The profile endpoint may return another user's private profile.",
                 reason="The endpoint accepts an arbitrary user identifier.",
@@ -89,6 +93,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="GET /api/documents/missing",
+                operation_method="GET", operation_path="/api/documents/{id}",
                 expected_security_boundary="Unknown document identifiers must return 404.",
                 hypothesis="A missing document may disclose internal information.",
                 reason="Error paths can expose implementation details.",
@@ -97,6 +102,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="GET /api/documents/{own_id}",
+                operation_method="GET", operation_path="/api/documents/{id}",
                 expected_security_boundary="An owner may read their own private document.",
                 hypothesis="The normal owner path may be unavailable or inconsistent.",
                 reason="A positive control distinguishes an authorization issue from a broken feature.",
@@ -105,6 +111,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="POST /api/documents/{id}",
+                operation_method="POST", operation_path="/api/documents/{id}",
                 expected_security_boundary="State-changing actions require explicit program permission.",
                 hypothesis="A write method may be reachable through a read-only scope.",
                 reason="Method confusion is a common policy failure mode.",
@@ -183,12 +190,14 @@ class BlindBenchmarkProvider(Provider):
                 boundary = "A one-time business operation should not be repeatable after its state is consumed."
                 statement = "The endpoint may allow an invalid state transition or repeated benefit."
                 accounts = ["account_a"]
-            candidates.append(Hypothesis(
+            candidates.append(BenchmarkHypothesis(
                 program_id=program_id,
                 target_profile_id=context.get("target_profile_id"),
                 asset=asset,
                 category=kind,
                 feature=f"{method} {path}",
+                operation_method=method,
+                operation_path=path,
                 expected_security_boundary=boundary,
                 hypothesis=statement,
                 reason=f"Public operation description: {description}",
@@ -204,9 +213,9 @@ class BlindBenchmarkProvider(Provider):
                 source="blind-benchmark",
             ))
         while len(candidates) < 5:
-            candidates.append(Hypothesis(
+            candidates.append(BenchmarkHypothesis(
                 program_id=program_id, target_profile_id=context.get("target_profile_id"), asset=asset,
-                category="authorization", feature="generic negative control",
+                category="authorization", feature="generic negative control", operation_method="GET", operation_path="/api/items/{id}",
                 expected_security_boundary="A denied request must not return protected data.",
                 hypothesis="A safe control may unexpectedly cross a security boundary.",
                 reason="Negative control for false-positive measurement.",
@@ -218,7 +227,9 @@ class BlindBenchmarkProvider(Provider):
         return ProviderResult(batch, self.name, self.model, ProviderUsage(input_tokens=0, output_tokens=0), 0.0, 0.0)
 
     def validation_plan(self, hypothesis: Hypothesis, context: dict[str, Any]) -> ProviderResult:
-        feature_path = hypothesis.feature.split(" ", 1)[1] if " " in hypothesis.feature else hypothesis.feature
+        feature_path = hypothesis.operation_path
+        if not feature_path:
+            raise ValueError("Benchmark hypothesis is missing operation_path")
         operation = next(item for item in context.get("operations", []) if item["path"] == feature_path)
         target_path = _benchmark_target_path(operation["path"])
         is_business = _benchmark_kind(operation["path"]) == "business"
@@ -360,7 +371,8 @@ class OpenAICompatibleProvider(Provider):
         return payload, content, payload.get("usage", {})
 
     def plan(self, program_id: str, asset: str, context: dict[str, Any] | None = None) -> ProviderResult:
-        return self._call("planner", {"program_id": program_id, "asset": asset, **(context or {})}, HypothesisBatch)
+        schema = BenchmarkHypothesisBatch if asset == "lab://benchmark" else HypothesisBatch
+        return self._call("planner", {"program_id": program_id, "asset": asset, **(context or {})}, schema)
 
     def validation_plan(self, hypothesis: Hypothesis, context: dict[str, Any]) -> ProviderResult:
         return self._call("validator-planner", {"hypothesis": hypothesis.model_dump(mode="json"), **context}, ValidationPlan)

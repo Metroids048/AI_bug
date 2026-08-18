@@ -153,16 +153,27 @@ def experiment_run(
         raise typer.BadParameter("M2.6 requires an authorized lab://benchmark program.")
     runner = ExperimentRunner(repo, provider_factory(provider), LocalLabExecutor(lab_name="benchmark"))
     runs = runner.run(program, profile, rounds=rounds)
-    typer.echo(json.dumps({"run_ids": [item.id for item in runs], "summary": repo.experiment_summary(program.id)}, indent=2))
+    batch_id = runs[0].experiment_batch_id if runs else None
+    typer.echo(json.dumps({"batch_id": batch_id, "run_ids": [item.id for item in runs], "summary": repo.experiment_summary(program.id, batch_id=batch_id)}, indent=2))
 
 
 @app.command("experiment-summary")
 def experiment_summary(
     program_id: str | None = typer.Option(None, "--program-id"),
+    batch_id: str | None = typer.Option(None, "--batch-id"),
     db: Path = typer.Option(Path("data/bugbounty.sqlite3"), "--db"),
 ) -> None:
     repo = repository(db)
-    typer.echo(json.dumps(repo.experiment_summary(program_id), indent=2))
+    typer.echo(json.dumps(repo.experiment_summary(program_id, batch_id=batch_id), indent=2))
+
+
+@app.command("experiment-list")
+def experiment_list(
+    program_id: str = typer.Option(..., "--program-id"),
+    db: Path = typer.Option(Path("data/bugbounty.sqlite3"), "--db"),
+) -> None:
+    repo = repository(db)
+    typer.echo(json.dumps([item.model_dump(mode="json") for item in repo.experiment_list(program_id)], indent=2))
 
 
 @app.command("report")

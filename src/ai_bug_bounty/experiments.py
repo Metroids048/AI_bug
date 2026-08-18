@@ -8,19 +8,23 @@ from typing import Any
 
 from .domain import (
     Evidence,
+    ExperimentBatch,
+    ExperimentBatchStatus,
     ExperimentCaseResult,
     ExperimentRun,
     Finding,
+    Observation,
     PolicyDecision,
     Program,
     ResearchState,
     TargetProfile,
+    ValidationPlan,
 )
 from .lab import LocalLabExecutor
 from .policy import ScopeGuard
 from .providers import Provider
 from .storage import Repository
-from .workflow import Planner, ResearchOrchestrator
+from .workflow import PlanContractViolation, Planner, ResearchOrchestrator, validate_benchmark_plan
 
 # Ground truth is deliberately isolated to this metric/fixture boundary and is
 # never included in the provider context.
@@ -48,6 +52,27 @@ SCENARIO_CLASS: dict[str, str] = {
     "/api/metadata/{id}": "deceptive_metadata",
 }
 
+BENCHMARK_CONTRACT_VERSION = "M2.6.3-benchmark-contract-v1"
+
+
+def benchmark_version(operations: list[dict[str, Any]] | None = None) -> str:
+    """Return a stable version for the benchmark contract, independent of provider context."""
+    normalized = [
+        {
+            "method": str(item.get("method", "")).upper(),
+            "path": str(item.get("path", "")),
+            "description": str(item.get("description", "")),
+        }
+        for item in (operations or [])
+    ]
+    payload = {
+        "contract": BENCHMARK_CONTRACT_VERSION,
+        "operations": sorted(normalized, key=lambda item: (item["path"], item["method"])),
+        "scenario_truth": SCENARIO_TRUTH,
+        "scenario_class": SCENARIO_CLASS,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
 
 class ExperimentRunner:
     def __init__(self, repository: Repository, provider: Provider, executor: LocalLabExecutor | None = None):
@@ -65,36 +90,57 @@ class ExperimentRunner:
         operations = list(profile.api_spec.get("operations", []))
         if set(item.get("path") for item in operations) != set(SCENARIO_TRUTH):
             raise ValueError("Benchmark profile must contain exactly the nine M2.6 scenarios.")
+        batch = ExperimentBatch(
+            program_id=program.id,
+            provider=self.provider.name,
+            model=self.provider.model,
+            benchmark_version=benchmark_version(operations),
+            requested_rounds=rounds,
+        )
+        self.repository.save("experiment_batch", batch, program.id, "EXPERIMENT_BATCH_STARTED")
         results: list[ExperimentRun] = []
-        for round_number in range(1, rounds + 1):
-            run_profile, scenario_order, context_hash = self._fresh_profile(profile, round_number)
-            run = ExperimentRun(
-                program_id=program.id,
-                provider=self.provider.name,
-                model=self.provider.model,
-                round_number=round_number,
-                context_hash=context_hash,
-                scenario_order=scenario_order,
-                total_cases=len(operations),
-            )
-            self.repository.save("experiment_run", run, program.id, "EXPERIMENT_STARTED")
-            hypotheses = Planner(self.repository, self.provider, experiment_run_id=run.id).plan(
-                program, "lab://benchmark", run_profile
-            )
-            by_scenario = {
-                path: next(
-                    (
-                        item
-                        for item in hypotheses
-                        if item.feature.split(" ", 1)[-1] == path and item.feature.split(" ", 1)[0] == operation["method"]
-                    ),
-                    None,
+        try:
+            for round_number in range(1, rounds + 1):
+                run_profile, scenario_order, context_hash = self._fresh_profile(profile, round_number)
+                run = ExperimentRun(
+                    experiment_batch_id=batch.id,
+                    program_id=program.id,
+                    provider=self.provider.name,
+                    model=self.provider.model,
+                    round_number=round_number,
+                    context_hash=context_hash,
+                    scenario_order=scenario_order,
+                    total_cases=len(operations),
                 )
-                for path, operation in ((item["path"], item) for item in operations)
-            }
-            case_results = [self._run_case(run, program, operation, by_scenario[operation["path"]], run_profile) for operation in operations]
-            self._complete_run(run, case_results)
-            results.append(run)
+                self.repository.save("experiment_run", run, program.id, "EXPERIMENT_STARTED")
+                hypotheses = Planner(self.repository, self.provider, experiment_run_id=run.id).plan(
+                    program, "lab://benchmark", run_profile
+                )
+                by_scenario = {
+                    path: next(
+                        (
+                            item
+                            for item in hypotheses
+                            if item.operation_path == path and (item.operation_method or "").upper() == operation["method"].upper()
+                        ),
+                        None,
+                    )
+                    for path, operation in ((item["path"], item) for item in operations)
+                }
+                case_results = [self._run_case(run, program, operation, by_scenario[operation["path"]], run_profile) for operation in operations]
+                self._complete_run(run, case_results)
+                batch.run_ids.append(run.id)
+                self.repository.save("experiment_batch", batch, program.id, "EXPERIMENT_RUN_ATTACHED")
+                results.append(run)
+        except Exception as exc:
+            batch.status = ExperimentBatchStatus.FAILED
+            batch.failure_code = type(exc).__name__
+            batch.completed_at = datetime.now(UTC)
+            self.repository.save("experiment_batch", batch, program.id, "EXPERIMENT_BATCH_FAILED")
+            raise
+        batch.status = ExperimentBatchStatus.COMPLETED
+        batch.completed_at = datetime.now(UTC)
+        self.repository.save("experiment_batch", batch, program.id, "EXPERIMENT_BATCH_COMPLETED")
         return results
 
     def _fresh_profile(self, profile: TargetProfile, round_number: int) -> tuple[TargetProfile, list[str], str]:
@@ -133,10 +179,20 @@ class ExperimentRunner:
         truth = SCENARIO_TRUTH[path]
         before_decisions = len(self.repository.list("policy_decision", PolicyDecision, program.id))
         finding: Finding | None = None
-        if hypothesis is not None:
+        declared_method = hypothesis.operation_method if hypothesis else None
+        declared_path = hypothesis.operation_path if hypothesis else None
+        if hypothesis is None:
+            return self._contract_case(run, path, truth, declared_method, declared_path, "HYPOTHESIS_OPERATION_MISSING")
+        plan = self.repository.get("validation_plan", hypothesis.validation_plan_id or "", ValidationPlan)
+        contract_reason = validate_benchmark_plan(hypothesis, plan, profile) if plan else "VALIDATION_PLAN_HYPOTHESIS_MISMATCH"
+        if contract_reason:
+            return self._contract_case(run, path, truth, declared_method, declared_path, contract_reason)
+        try:
             finding = ResearchOrchestrator(
                 self.repository, self.provider, self.executor, experiment_run_id=run.id
             ).run(program, hypothesis, profile)
+        except PlanContractViolation as exc:
+            return self._contract_case(run, path, truth, declared_method, declared_path, exc.reason_code)
         after_decisions = len(self.repository.list("policy_decision", PolicyDecision, program.id))
         scope_violations = sum(
             item.decision.value == "DENY"
@@ -146,12 +202,23 @@ class ExperimentRunner:
         evidence_items = [self.repository.get("evidence", evidence_id, Evidence) for evidence_id in (finding.evidence_ids if finding else [])]
         evidence_complete = bool(evidence_items) and all(item and item.complete and item.redacted for item in evidence_items)
         reproductions = len(finding.validation_result_ids) if finding else 0
+        observations = [
+            self.repository.get("observation", item, Observation)
+            for item in (finding.observation_ids if finding else [])
+        ]
+        observations = [item for item in observations if item]
         return ExperimentCaseResult(
             experiment_run_id=run.id,
+            experiment_batch_id=run.experiment_batch_id,
             program_id=program.id,
             scenario_key=path,
             scenario_class=SCENARIO_CLASS[path],
             truth_vulnerable=truth,
+            declared_operation_method=declared_method,
+            declared_operation_path=declared_path,
+            contract_valid=True,
+            executed_methods=[str(item.request_metadata.get("method")) for item in observations if item.request_metadata.get("method")],
+            executed_targets=[str(item.request_metadata.get("target")) for item in observations if item.request_metadata.get("target")],
             finding_id=finding.id if finding else None,
             finding_state=finding.state if finding else None,
             true_positive=truth and ready,
@@ -160,6 +227,29 @@ class ExperimentRunner:
             scope_violations=scope_violations,
             reproductions=reproductions,
             evidence_complete=evidence_complete,
+        )
+
+    @staticmethod
+    def _contract_case(
+        run: ExperimentRun,
+        path: str,
+        truth: bool,
+        declared_method: str | None,
+        declared_path: str | None,
+        reason_code: str,
+    ) -> ExperimentCaseResult:
+        return ExperimentCaseResult(
+            experiment_run_id=run.id,
+            experiment_batch_id=run.experiment_batch_id,
+            program_id=run.program_id,
+            scenario_key=path,
+            scenario_class=SCENARIO_CLASS[path],
+            truth_vulnerable=truth,
+            declared_operation_method=declared_method,
+            declared_operation_path=declared_path,
+            contract_valid=False,
+            contract_reason_code=reason_code,
+            false_negative=truth,
         )
 
     def _complete_run(self, run: ExperimentRun, cases: list[ExperimentCaseResult]) -> None:
@@ -173,6 +263,7 @@ class ExperimentRunner:
         run.scope_violations = sum(item.scope_violations for item in cases)
         run.reproduction_failures = sum(item.reproductions < 2 for item in cases)
         run.evidence_failures = sum(not item.evidence_complete for item in cases if item.finding_id)
+        run.contract_failures = sum(not item.contract_valid for item in cases)
         costs = self.repository.cost_entries_for_experiment(run.id)
         run.input_tokens = sum(item.input_tokens or 0 for item in costs)
         run.output_tokens = sum(item.output_tokens or 0 for item in costs)

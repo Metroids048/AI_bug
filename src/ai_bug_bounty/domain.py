@@ -199,6 +199,8 @@ class Hypothesis(StrictModel):
     category: str
     asset: str
     feature: str
+    operation_method: str | None = None
+    operation_path: str | None = None
     expected_security_boundary: str
     hypothesis: str
     reason: str
@@ -426,6 +428,7 @@ class PlatformResult(StrictModel):
 
 class ExperimentRun(StrictModel):
     id: str = Field(default_factory=new_id)
+    experiment_batch_id: str | None = None
     program_id: str
     provider: str
     model: str
@@ -441,6 +444,7 @@ class ExperimentRun(StrictModel):
     scope_violations: int = 0
     reproduction_failures: int = 0
     evidence_failures: int = 0
+    contract_failures: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     known_cost: float = 0.0
@@ -449,13 +453,40 @@ class ExperimentRun(StrictModel):
     completed_at: datetime | None = None
 
 
+class ExperimentBatchStatus(str, Enum):
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class ExperimentBatch(StrictModel):
+    id: str = Field(default_factory=new_id)
+    program_id: str
+    provider: str
+    model: str
+    benchmark_version: str
+    requested_rounds: int = Field(ge=1)
+    run_ids: list[str] = Field(default_factory=list)
+    status: ExperimentBatchStatus = ExperimentBatchStatus.RUNNING
+    failure_code: str | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+    completed_at: datetime | None = None
+
+
 class ExperimentCaseResult(StrictModel):
     id: str = Field(default_factory=new_id)
     experiment_run_id: str
+    experiment_batch_id: str | None = None
     program_id: str
     scenario_key: str
     scenario_class: str
     truth_vulnerable: bool
+    declared_operation_method: str | None = None
+    declared_operation_path: str | None = None
+    contract_valid: bool = True
+    contract_reason_code: str | None = None
+    executed_methods: list[str] = Field(default_factory=list)
+    executed_targets: list[str] = Field(default_factory=list)
     finding_id: str | None = None
     finding_state: ResearchState | None = None
     true_positive: bool = False
@@ -482,6 +513,15 @@ class AuditEvent(StrictModel):
 
 class HypothesisBatch(StrictModel):
     hypotheses: list[Hypothesis] = Field(min_length=5, max_length=20)
+
+
+class BenchmarkHypothesis(Hypothesis):
+    operation_method: str
+    operation_path: str
+
+
+class BenchmarkHypothesisBatch(StrictModel):
+    hypotheses: list[BenchmarkHypothesis] = Field(min_length=5, max_length=20)
 
 
 class SkepticResult(StrictModel):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from .cost import record_usage
 from .domain import (
@@ -28,6 +29,82 @@ from .policy import ScopeGuard
 from .providers import Provider
 from .state import transition_research
 from .storage import Repository
+
+
+class PlanContractViolation(ValueError):
+    def __init__(self, reason_code: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+def resolve_benchmark_operation(method: str, target: str, operations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    parsed = urlsplit(target)
+    if parsed.scheme != "lab" or parsed.netloc != "benchmark":
+        return None
+    actual = [segment for segment in parsed.path.split("/") if segment]
+    normalized_method = method.upper()
+    for operation in operations:
+        template = str(operation.get("path", ""))
+        expected = [segment for segment in template.split("/") if segment]
+        if len(actual) != len(expected):
+            continue
+        if all(
+            (segment[:1] == "{" and segment[-1:] == "}" and actual[index] != "")
+            or segment == actual[index]
+            for index, segment in enumerate(expected)
+        ):
+            return operation if str(operation.get("method", "")).upper() == normalized_method else {
+                "_method_mismatch": True,
+                **operation,
+            }
+    return None
+
+
+def validate_benchmark_plan(
+    hypothesis: Hypothesis,
+    plan: ValidationPlan,
+    target_profile: TargetProfile,
+) -> str | None:
+    """Validate the identity and semantic contract before any target action."""
+    if not hypothesis.operation_method or not hypothesis.operation_path:
+        return "HYPOTHESIS_OPERATION_MISSING"
+    operations = list(target_profile.api_spec.get("operations", []))
+    declared = next(
+        (
+            operation for operation in operations
+            if str(operation.get("method", "")).upper() == hypothesis.operation_method.upper()
+            and operation.get("path") == hypothesis.operation_path
+        ),
+        None,
+    )
+    if declared is None:
+        return "HYPOTHESIS_OPERATION_UNKNOWN"
+    if plan.hypothesis_id != hypothesis.id:
+        return "VALIDATION_PLAN_HYPOTHESIS_MISMATCH"
+    phases = {item.phase for item in plan.steps}
+    if any(item.phase not in {"CONTROL", "TEST"} for item in plan.steps):
+        return "INVALID_PHASE"
+    if "CONTROL" not in phases:
+        return "MISSING_CONTROL"
+    if "TEST" not in phases:
+        return "MISSING_TEST"
+    resolved: list[dict[str, Any]] = []
+    for step in plan.steps:
+        parsed = urlsplit(step.target)
+        if parsed.scheme != "lab" or parsed.netloc != "benchmark":
+            return "STEP_TARGET_OUTSIDE_BENCHMARK"
+        operation = resolve_benchmark_operation(step.method, step.target, operations)
+        if operation is None:
+            return "STEP_OPERATION_UNKNOWN"
+        if operation.get("_method_mismatch", False):
+            return "STEP_METHOD_MISMATCH"
+        resolved.append(operation)
+    operation_keys = {(str(item.get("method", "")).upper(), item.get("path")) for item in resolved}
+    if len(operation_keys) > 1:
+        return "MULTI_OPERATION_PLAN"
+    if operation_keys != {(hypothesis.operation_method.upper(), hypothesis.operation_path)}:
+        return "SCENARIO_MISMATCH"
+    return None
 
 
 def _provider_context(profile: TargetProfile | None) -> dict[str, Any]:
@@ -205,6 +282,12 @@ class ResearchOrchestrator:
             plan_result = self.provider.validation_plan(hypothesis, _provider_context(target_profile))
             plan = plan_result.data
             self.repository.save("validation_plan", plan, program.id, "VALIDATION_PLAN_CREATED")
+        if hypothesis.asset == "lab://benchmark":
+            if target_profile is None:
+                raise PlanContractViolation("STEP_TARGET_OUTSIDE_BENCHMARK")
+            contract_reason = validate_benchmark_plan(hypothesis, plan, target_profile)
+            if contract_reason:
+                raise PlanContractViolation(contract_reason)
         hypothesis.state = transition_research(hypothesis.state, ResearchState.TESTING)
         self.repository.save("hypothesis", hypothesis, program.id, "RESEARCH_STARTED")
         finding = Finding(
