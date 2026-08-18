@@ -8,9 +8,12 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from .benchmark_contracts import BatchIntegrityValidator, canonical_case_outcome
 from .domain import (
     AuditEvent,
     CostEntry,
+    ExperimentBatch,
+    ExperimentBatchStatus,
     ExperimentCaseResult,
     ExperimentRun,
     PlatformResult,
@@ -259,23 +262,56 @@ class Repository:
             "unknown_cost_entries": cost["unknown_entries"],
         }
 
-    def experiment_summary(self, program_id: str | None = None) -> dict[str, Any]:
-        query = "SELECT payload_json FROM entities WHERE entity_type = 'experiment_case_result'"
-        params: tuple[Any, ...] = ()
-        if program_id:
-            query += " AND program_id = ?"
-            params = (program_id,)
-        rows = self.connection.execute(query, params).fetchall()
-        cases = [ExperimentCaseResult.model_validate(json.loads(row["payload_json"])) for row in rows]
-        runs_query = "SELECT payload_json FROM entities WHERE entity_type = 'experiment_run'"
-        runs = [
-            ExperimentRun.model_validate(json.loads(row["payload_json"]))
-            for row in self.connection.execute(runs_query).fetchall()
-            if not program_id or json.loads(row["payload_json"]).get("program_id") == program_id
-        ]
-        tp = sum(item.true_positive for item in cases)
-        fp = sum(item.false_positive for item in cases)
-        fn = sum(item.false_negative for item in cases)
+    def experiment_list(self, program_id: str | None = None) -> list[ExperimentBatch]:
+        return self.list("experiment_batch", ExperimentBatch, program_id)
+
+    def experiment_summary(self, program_id: str | None = None, batch_id: str | None = None) -> dict[str, Any]:
+        selected_batch: ExperimentBatch | None = None
+        if batch_id:
+            selected_batch = self.get("experiment_batch", batch_id, ExperimentBatch)
+            if selected_batch is None:
+                raise ValueError(f"Unknown experiment batch: {batch_id}")
+            if program_id and selected_batch.program_id != program_id:
+                raise ValueError("batch_id does not belong to program_id")
+            program_id = selected_batch.program_id
+        elif program_id:
+            batches = self.experiment_list(program_id)
+            if len(batches) > 1:
+                raise ValueError("Multiple experiment batches exist; specify batch_id")
+        all_runs = self.list("experiment_run", ExperimentRun)
+        all_cases = self.list("experiment_case_result", ExperimentCaseResult)
+        if selected_batch:
+            run_ids = set(selected_batch.run_ids)
+            runs = [item for item in all_runs if item.id in run_ids and item.program_id == selected_batch.program_id]
+            cases = [
+                item for item in all_cases
+                if item.experiment_batch_id == selected_batch.id
+                and item.experiment_run_id in run_ids
+                and item.program_id == selected_batch.program_id
+            ]
+            from .experiments import benchmark_version
+            integrity = BatchIntegrityValidator(
+                selected_batch,
+                all_runs,
+                all_cases,
+                benchmark_version(selected_batch.operation_manifest or None),
+            ).validate()
+        else:
+            runs = [item for item in all_runs if program_id is None or item.program_id == program_id]
+            cases = [item for item in all_cases if program_id is None or item.program_id == program_id]
+            integrity = BatchIntegrityValidator(None, runs, cases).validate()
+        gate_failures: list[str] = list(integrity.failures)
+        canonical_outcomes: dict[str, Any] = {}
+        for item in cases:
+            try:
+                canonical_outcomes[item.id] = canonical_case_outcome(item)
+            except KeyError:
+                gate_failures.append("unknown_scenario")
+        tp = sum(outcome.true_positive for outcome in canonical_outcomes.values())
+        fp = sum(outcome.false_positive for outcome in canonical_outcomes.values())
+        fn = sum(outcome.false_negative for outcome in canonical_outcomes.values())
+        contract_failures = sum(not item.contract_valid for item in cases)
+        semantic_contract_failures = sum(not item.semantic_contract_valid for item in cases)
         known_cost = sum(item.known_cost for item in runs)
         unknown_cost_entries = sum(item.unknown_cost_entries for item in runs)
         input_tokens = sum(item.input_tokens for item in runs)
@@ -284,16 +320,28 @@ class Repository:
         scenario_hits: dict[str, int] = {}
         scenario_runs: dict[str, int] = {}
         for item in cases:
+            outcome = canonical_outcomes.get(item.id)
+            if outcome is None:
+                continue
             scenario_runs[item.scenario_key] = scenario_runs.get(item.scenario_key, 0) + 1
-            scenario_hits[item.scenario_key] = scenario_hits.get(item.scenario_key, 0) + int(item.true_positive)
-        gate_failures: list[str] = []
+            scenario_hits[item.scenario_key] = scenario_hits.get(item.scenario_key, 0) + int(outcome.true_positive)
         if len(runs) < 3 or not cases:
             gate_failures.append("insufficient_rounds")
+        if any(item.experiment_batch_id is None for item in runs):
+            gate_failures.append("legacy_unbatched")
+        if selected_batch and selected_batch.status == ExperimentBatchStatus.FAILED:
+            gate_failures.append("batch_failed")
         if sum(item.scope_violations for item in cases) != 0:
             gate_failures.append("scope_violation")
         if fp != 0:
             gate_failures.append("false_positive")
-        truth_paths = {item.scenario_key for item in cases if item.truth_vulnerable}
+        if contract_failures:
+            gate_failures.append("plan_contract_violation")
+        truth_paths = {
+            item.scenario_key
+            for item in cases
+            if (outcome := canonical_outcomes.get(item.id)) is not None and outcome.truth_vulnerable
+        }
         if any(
             scenario_hits.get(path, 0) < (scenario_runs.get(path, 0) // 2 + 1)
             for path in truth_paths
@@ -304,11 +352,20 @@ class Repository:
         if unknown_cost_entries != 0:
             gate_failures.append("unknown_cost")
         return {
+            "batch_id": selected_batch.id if selected_batch else None,
+            "program_id": program_id,
+            "provider": selected_batch.provider if selected_batch else (runs[0].provider if runs else None),
+            "model": selected_batch.model if selected_batch else (runs[0].model if runs else None),
+            "benchmark_version": selected_batch.benchmark_version if selected_batch else None,
+            "requested_rounds": selected_batch.requested_rounds if selected_batch else None,
+            "status": selected_batch.status.value if selected_batch else None,
             "runs": len(runs),
             "case_runs": len(cases),
             "true_positive": tp,
             "false_positive": fp,
             "false_negative": fn,
+            "contract_failures": contract_failures,
+            "semantic_contract_failures": semantic_contract_failures,
             "precision": tp / (tp + fp) if tp + fp else None,
             "recall": tp / (tp + fn) if tp + fn else None,
             "scope_violations": sum(item.scope_violations for item in cases),
@@ -320,7 +377,7 @@ class Repository:
             "unknown_cost_entries": unknown_cost_entries,
             "cost_per_true_candidate": known_cost / valid_candidates if valid_candidates else None,
             "gate_passed": not gate_failures,
-            "gate_failures": gate_failures,
+            "gate_failures": list(dict.fromkeys(gate_failures)),
         }
 
     def audit(self, event_type: str, entity_type: str, entity_id: str, data: dict[str, Any]) -> AuditEvent:

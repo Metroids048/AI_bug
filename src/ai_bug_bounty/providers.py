@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -9,6 +10,8 @@ import httpx
 from pydantic import BaseModel
 
 from .domain import (
+    BenchmarkHypothesis,
+    BenchmarkHypothesisBatch,
     Hypothesis,
     HypothesisBatch,
     ImpactReviewResult,
@@ -23,6 +26,53 @@ T = TypeVar("T", bound=BaseModel)
 
 class ProviderDisabled(RuntimeError):
     pass
+
+
+class ProviderCallError(RuntimeError):
+    """Sanitized, deterministic failure contract for one provider call."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        reason_code: str,
+        http_status: int | None = None,
+        retry_after: str | None = None,
+    ):
+        self.stage = stage
+        self.reason_code = reason_code
+        self.http_status = http_status
+        self.retry_after = retry_after
+        status = f" status={http_status}" if http_status is not None else ""
+        super().__init__(f"{reason_code} at {stage}{status}")
+
+
+def _classify_provider_error(stage: str, exc: Exception) -> ProviderCallError:
+    if isinstance(exc, httpx.TimeoutException):
+        return ProviderCallError(stage=stage, reason_code="PROVIDER_TIMEOUT")
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        status = response.status_code if response is not None else None
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if status in {401, 403}:
+            reason_code = "PROVIDER_AUTH"
+        elif status == 429:
+            reason_code = "PROVIDER_RATE_LIMIT"
+        elif status is not None and 400 <= status < 500:
+            reason_code = "PROVIDER_REQUEST_REJECTED"
+        elif status is not None and 500 <= status < 600:
+            reason_code = "PROVIDER_UPSTREAM"
+        else:
+            reason_code = "PROVIDER_HTTP_ERROR"
+        return ProviderCallError(
+            stage=stage,
+            reason_code=reason_code,
+            http_status=status,
+            retry_after=retry_after,
+        )
+    if isinstance(exc, httpx.RequestError):
+        return ProviderCallError(stage=stage, reason_code="PROVIDER_NETWORK")
+    raise exc
 
 
 @dataclass
@@ -61,6 +111,38 @@ class DeterministicProvider(Provider):
     model = "offline-rules-v1"
 
     def plan(self, program_id: str, asset: str, context: dict[str, Any] | None = None) -> ProviderResult:
+        if asset == "lab://benchmark" and context and context.get("operations"):
+            candidates = [
+                BenchmarkHypothesis(
+                    program_id=program_id,
+                    target_profile_id=context.get("target_profile_id"),
+                    asset=asset,
+                    category="authorization",
+                    feature=f"{operation['method']} {operation['path']}",
+                    operation_method=operation["method"],
+                    operation_path=operation["path"],
+                    expected_security_boundary="The documented operation should respect its stated security boundary.",
+                    hypothesis="The operation may behave differently from its documented security boundary.",
+                    reason=f"Public operation description: {operation.get('description', '')}",
+                    validation_plan="Compare a control and test response.",
+                    required_accounts=["account_a", "account_b"],
+                    confidence=0.5,
+                    potential_impact=1,
+                    testability=1,
+                    scope_confidence=1,
+                    duplicate_risk=0.9,
+                    source="deterministic-fixture",
+                )
+                for operation in context["operations"]
+            ]
+            return ProviderResult(
+                BenchmarkHypothesisBatch(hypotheses=candidates),
+                self.name,
+                self.model,
+                ProviderUsage(input_tokens=0, output_tokens=0),
+                0.0,
+                0.0,
+            )
         common = {
             "program_id": program_id,
             "asset": asset,
@@ -73,6 +155,7 @@ class DeterministicProvider(Provider):
         candidates = [
             Hypothesis(
                 **common, feature="GET /api/documents/{id}",
+                operation_method="GET", operation_path="/api/documents/{id}",
                 expected_security_boundary="Account B must not read Account A private document.",
                 hypothesis="The document identifier may be accepted without an ownership check.",
                 reason="Object identifiers are read through an authenticated API path.",
@@ -81,6 +164,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="GET /api/profile/{user_id}",
+                operation_method="GET", operation_path="/api/profile/{user_id}",
                 expected_security_boundary="Account B must not read Account A private profile.",
                 hypothesis="The profile endpoint may return another user's private profile.",
                 reason="The endpoint accepts an arbitrary user identifier.",
@@ -89,6 +173,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="GET /api/documents/missing",
+                operation_method="GET", operation_path="/api/documents/{id}",
                 expected_security_boundary="Unknown document identifiers must return 404.",
                 hypothesis="A missing document may disclose internal information.",
                 reason="Error paths can expose implementation details.",
@@ -97,6 +182,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="GET /api/documents/{own_id}",
+                operation_method="GET", operation_path="/api/documents/{id}",
                 expected_security_boundary="An owner may read their own private document.",
                 hypothesis="The normal owner path may be unavailable or inconsistent.",
                 reason="A positive control distinguishes an authorization issue from a broken feature.",
@@ -105,6 +191,7 @@ class DeterministicProvider(Provider):
             ),
             Hypothesis(
                 **common, feature="POST /api/documents/{id}",
+                operation_method="POST", operation_path="/api/documents/{id}",
                 expected_security_boundary="State-changing actions require explicit program permission.",
                 hypothesis="A write method may be reachable through a read-only scope.",
                 reason="Method confusion is a common policy failure mode.",
@@ -183,12 +270,14 @@ class BlindBenchmarkProvider(Provider):
                 boundary = "A one-time business operation should not be repeatable after its state is consumed."
                 statement = "The endpoint may allow an invalid state transition or repeated benefit."
                 accounts = ["account_a"]
-            candidates.append(Hypothesis(
+            candidates.append(BenchmarkHypothesis(
                 program_id=program_id,
                 target_profile_id=context.get("target_profile_id"),
                 asset=asset,
                 category=kind,
                 feature=f"{method} {path}",
+                operation_method=method,
+                operation_path=path,
                 expected_security_boundary=boundary,
                 hypothesis=statement,
                 reason=f"Public operation description: {description}",
@@ -204,9 +293,9 @@ class BlindBenchmarkProvider(Provider):
                 source="blind-benchmark",
             ))
         while len(candidates) < 5:
-            candidates.append(Hypothesis(
+            candidates.append(BenchmarkHypothesis(
                 program_id=program_id, target_profile_id=context.get("target_profile_id"), asset=asset,
-                category="authorization", feature="generic negative control",
+                category="authorization", feature="generic negative control", operation_method="GET", operation_path="/api/items/{id}",
                 expected_security_boundary="A denied request must not return protected data.",
                 hypothesis="A safe control may unexpectedly cross a security boundary.",
                 reason="Negative control for false-positive measurement.",
@@ -218,7 +307,9 @@ class BlindBenchmarkProvider(Provider):
         return ProviderResult(batch, self.name, self.model, ProviderUsage(input_tokens=0, output_tokens=0), 0.0, 0.0)
 
     def validation_plan(self, hypothesis: Hypothesis, context: dict[str, Any]) -> ProviderResult:
-        feature_path = hypothesis.feature.split(" ", 1)[1] if " " in hypothesis.feature else hypothesis.feature
+        feature_path = hypothesis.operation_path
+        if not feature_path:
+            raise ValueError("Benchmark hypothesis is missing operation_path")
         operation = next(item for item in context.get("operations", []) if item["path"] == feature_path)
         target_path = _benchmark_target_path(operation["path"])
         is_business = _benchmark_kind(operation["path"]) == "business"
@@ -277,22 +368,34 @@ class OpenAICompatibleProvider(Provider):
         network_enabled: bool = False,
         input_price_per_million: float | None = None,
         output_price_per_million: float | None = None,
+        timeout_seconds: float = 30.0,
     ):
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be a finite positive number")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.network_enabled = network_enabled
         self.input_price_per_million = input_price_per_million
         self.output_price_per_million = output_price_per_million
+        self.timeout_seconds = timeout_seconds
 
     def _call(self, task: str, context: dict[str, Any], schema: type[T]) -> ProviderResult:
         if not self.network_enabled:
             raise ProviderDisabled("Model network is disabled; enable it explicitly for a smoke test.")
         if not self.api_key:
             raise ProviderDisabled("Model API key is missing; set ABB_LLM_API_KEY explicitly.")
-        schema_json = json.dumps(schema.model_json_schema(), sort_keys=True)
+        schema_definition = schema.model_json_schema()
+        if task == "validator-planner" and context.get("hypothesis", {}).get("asset") == "lab://benchmark":
+            schema_definition = _without_benchmark_oracle_fields(schema_definition)
+        schema_json = json.dumps(schema_definition, sort_keys=True)
         prompt = self._prompt(task, context, schema_json)
-        _, content, usage = self._request(prompt, schema)
+        try:
+            _, content, usage = self._request(prompt, schema, schema_definition)
+        except ProviderCallError:
+            raise
+        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+            raise _classify_provider_error(task, exc) from exc
         try:
             result = schema.model_validate_json(content)
         except Exception as first_error:
@@ -303,7 +406,12 @@ class OpenAICompatibleProvider(Provider):
                 repair=f"The previous JSON failed schema validation: {str(first_error)[:1000]}",
                 previous_response=content,
             )
-            _, repair_content, repair_usage = self._request(repair_prompt, schema)
+            try:
+                _, repair_content, repair_usage = self._request(repair_prompt, schema, schema_definition)
+            except ProviderCallError:
+                raise
+            except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+                raise _classify_provider_error(task, exc) from exc
             usage = _merge_usage(usage, repair_usage)
             try:
                 result = schema.model_validate_json(repair_content)
@@ -323,18 +431,37 @@ class OpenAICompatibleProvider(Provider):
         repair: str | None = None,
         previous_response: str | None = None,
     ) -> str:
+        prompt_context = dict(context)
+        coverage_repair = prompt_context.pop("_benchmark_coverage_repair", None)
         lines = [
             "Return exactly one JSON object and no Markdown.",
             "Use only facts from Context; do not invent scope, accounts, observations, or business rules.",
             f"Task: {task}",
             f"JSON Schema: {schema_json}",
-            f"Context: {json.dumps(context, sort_keys=True)}",
         ]
+        if task == "planner" and prompt_context.get("asset") == "lab://benchmark":
+            lines.extend([
+                "For the benchmark, return exactly one hypothesis for every public operation in Context.operations.",
+                "Preserve each operation's method and path exactly.",
+                "Do not omit, duplicate, merge, invent, rank away, or replace operations.",
+                "This requirement describes experiment coverage only.",
+                "It does not imply that any operation is vulnerable.",
+            ])
+        lines.append(f"Context: {json.dumps(prompt_context, sort_keys=True)}")
+        if coverage_repair:
+            lines.extend([
+                "Structural coverage repair diagnostics (operation identities only):",
+                f"Missing operation identities: {json.dumps(coverage_repair.get('missing', []), sort_keys=True)}",
+                f"Duplicate operation identities: {json.dumps(coverage_repair.get('duplicate', []), sort_keys=True)}",
+                f"Unknown operation identities: {json.dumps(coverage_repair.get('unknown', []), sort_keys=True)}",
+            ])
         if repair:
             lines.extend([repair, f"Previous response to repair: {previous_response or ''}"])
         return "\n".join(lines)
 
-    def _request(self, prompt: str, schema: type[T]) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    def _request(
+        self, prompt: str, schema: type[T], schema_definition: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
         request_json: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
@@ -343,24 +470,29 @@ class OpenAICompatibleProvider(Provider):
         if os.getenv("ABB_LLM_STRUCTURED_OUTPUT", "false").lower() == "true":
             request_json["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": schema.__name__, "strict": True, "schema": schema.model_json_schema()},
+                "json_schema": {"name": schema.__name__, "strict": True, "schema": schema_definition or schema.model_json_schema()},
             }
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             json=request_json,
-            timeout=30,
+            timeout=self.timeout_seconds,
         )
         # Mock transports may not attach a Request object; status-code gating
         # preserves the HTTP error behavior without requiring that metadata.
         if response.status_code >= 400:
-            response.raise_for_status()
+            try:
+                request = response.request
+            except RuntimeError:
+                request = httpx.Request("POST", f"{self.base_url}/chat/completions")
+            raise httpx.HTTPStatusError("provider returned an HTTP error", request=request, response=response)
         payload = response.json()
         content = _clean_json_content(payload["choices"][0]["message"]["content"])
         return payload, content, payload.get("usage", {})
 
     def plan(self, program_id: str, asset: str, context: dict[str, Any] | None = None) -> ProviderResult:
-        return self._call("planner", {"program_id": program_id, "asset": asset, **(context or {})}, HypothesisBatch)
+        schema = BenchmarkHypothesisBatch if asset == "lab://benchmark" else HypothesisBatch
+        return self._call("planner", {"program_id": program_id, "asset": asset, **(context or {})}, schema)
 
     def validation_plan(self, hypothesis: Hypothesis, context: dict[str, Any]) -> ProviderResult:
         return self._call("validator-planner", {"hypothesis": hypothesis.model_dump(mode="json"), **context}, ValidationPlan)
@@ -383,6 +515,11 @@ def provider_factory(name: str | None = None) -> Provider:
         model = os.getenv("ABB_LLM_MODEL", "deepseek-chat")
         api_key = os.getenv("ABB_LLM_API_KEY", "")
         network_enabled = os.getenv("ABB_LLM_NETWORK_ENABLED", "false").lower() == "true"
+        raw_timeout = os.getenv("ABB_LLM_TIMEOUT_SECONDS", "30")
+        try:
+            timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ABB_LLM_TIMEOUT_SECONDS must be a finite positive number") from exc
         return OpenAICompatibleProvider(
             base_url=base_url,
             model=model,
@@ -390,6 +527,7 @@ def provider_factory(name: str | None = None) -> Provider:
             network_enabled=network_enabled,
             input_price_per_million=_optional_float(os.getenv("ABB_LLM_INPUT_PRICE_PER_MILLION")),
             output_price_per_million=_optional_float(os.getenv("ABB_LLM_OUTPUT_PRICE_PER_MILLION")),
+            timeout_seconds=timeout_seconds,
         )
     raise ValueError(f"Unknown provider: {name}")
 
@@ -416,6 +554,20 @@ def _merge_usage(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any
         left, right = first.get(key), second.get(key)
         merged[key] = left + right if isinstance(left, int) and isinstance(right, int) else None
     return merged
+
+
+def _without_benchmark_oracle_fields(value: Any) -> Any:
+    """Keep answer schemas useful without exposing expected status fields to a model."""
+    if isinstance(value, dict):
+        result = {key: _without_benchmark_oracle_fields(item) for key, item in value.items()}
+        if isinstance(result.get("properties"), dict):
+            result["properties"].pop("expected_status", None)
+        if isinstance(result.get("required"), list):
+            result["required"] = [item for item in result["required"] if item != "expected_status"]
+        return result
+    if isinstance(value, list):
+        return [_without_benchmark_oracle_fields(item) for item in value]
+    return value
 
 
 def _benchmark_target_path(path: str) -> str:
