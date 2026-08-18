@@ -15,10 +15,27 @@
 - OpenAI-compatible provider 可显式接入真实模型，价格能传入 Cost Ledger。
 - PlatformResult 可记录 `VALID/DUPLICATE/INFORMATIVE/N/A/INVALID/PAID`，ROI 输出 Revenue、Net Profit 和 ROI。
 
-## Verification Result (2026-08-18, M2.6.3)
+## Verification Result (2026-08-18, M2.6.4)
+
+- **M2.6.4 OFFLINE GATE INTEGRITY: PASS**（fresh SQLite，3 rounds × 9 scenarios = 27 case-runs）。
+- `agent-python -m pytest -q`: **68 passed**。
+- `agent-python -m ruff check src tests`: **All checks passed**。
+- `agent-python -m compileall -q src tests`: **PASS**。
+- `agent-python -m pip check`: **No broken requirements found**。
+- `git diff --check`: **PASS**。
+- Fresh blind result: `COMPLETED`, `TP=9`, `FP=0`, `FN=0`, `precision=1.0`, `recall=1.0`, `contract_failures=0`, `semantic_contract_failures=0`, `scope_violations=0`, `reproduction_failures=0`, `evidence_failures=0`, `gate_passed=true`。
+- Exact batch integrity now rejects missing batch identity, RUNNING/incomplete batches, requested-round mismatch, missing/duplicate scenarios, incomplete runs, and foreign run/case borrowing.
+- Hidden semantic contracts reject same-account fake IDOR, different-resource fake IDOR, different-code replay, and cross-account replay plans; information contracts distinguish safe fields from scenario-defined sensitive fields.
+- Oracle isolation covers Provider context and benchmark ValidationPlan prompt/schema; `expected_status` is not exposed to a real benchmark validator model.
+- Verification commit: `5b4fc1f`
+- Real-Model Gate: **NOT VERIFIED**（本轮没有配置或调用 `ABB_LLM_*` endpoint）。
+- M3 live target: **BLOCKED**。
+
+## Earlier Verification Result (2026-08-18, M2.6.3)
 
 - M2.6.3 Gate Integrity implemented: exact ExperimentBatch isolation, structured operation/plan contract, execution target audit, and dynamic plan-derived reports.
-- `agent-python -m pytest -q`: **41 passed**。
+- `agent-python -m pytest -q`: **50 passed**。
+- Verification commit: `de7b424`
 - `agent-python -m ruff check src tests`: **All checks passed**。
 - `agent-python -m compileall -q src tests`: **PASS**。
 - `agent-python -m pip check`: **No broken requirements found**。
