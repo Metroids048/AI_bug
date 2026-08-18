@@ -35,6 +35,7 @@ from ai_bug_bounty.providers import (
     DeterministicProvider,
     OpenAICompatibleProvider,
     ProviderDisabled,
+    provider_factory,
 )
 from ai_bug_bounty.reporting import ReportService
 from ai_bug_bounty.state import InvalidTransition, transition_research
@@ -259,6 +260,33 @@ def test_compatible_provider_includes_schema_and_repairs_once(monkeypatch):
     assert "schema validation" in prompts[1]
     assert result.usage.input_tokens == 8
     assert result.usage.output_tokens == 9
+
+
+def test_provider_factory_reads_llm_timeout_seconds(monkeypatch):
+    monkeypatch.setenv("ABB_LLM_TIMEOUT_SECONDS", "180")
+    provider = provider_factory("openai-compatible")
+    assert provider.timeout_seconds == 180.0
+
+
+def test_compatible_provider_uses_configured_timeout(monkeypatch):
+    fixture = DeterministicProvider().plan("program", "lab://idor")
+    captured: dict[str, object] = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs)
+        return httpx.Response(200, json={"choices": [{"message": {"content": fixture.data.model_dump_json()}}], "usage": {}})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True, timeout_seconds=180.0)
+    provider.plan("program", "lab://idor")
+    assert captured["timeout"] == 180.0
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-1"])
+def test_invalid_llm_timeout_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("ABB_LLM_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError):
+        provider_factory("openai-compatible")
 
 
 def test_invalid_state_transition_is_rejected():

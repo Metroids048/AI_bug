@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -288,13 +289,17 @@ class OpenAICompatibleProvider(Provider):
         network_enabled: bool = False,
         input_price_per_million: float | None = None,
         output_price_per_million: float | None = None,
+        timeout_seconds: float = 30.0,
     ):
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be a finite positive number")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.network_enabled = network_enabled
         self.input_price_per_million = input_price_per_million
         self.output_price_per_million = output_price_per_million
+        self.timeout_seconds = timeout_seconds
 
     def _call(self, task: str, context: dict[str, Any], schema: type[T]) -> ProviderResult:
         if not self.network_enabled:
@@ -360,7 +365,7 @@ class OpenAICompatibleProvider(Provider):
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             json=request_json,
-            timeout=30,
+            timeout=self.timeout_seconds,
         )
         # Mock transports may not attach a Request object; status-code gating
         # preserves the HTTP error behavior without requiring that metadata.
@@ -395,6 +400,11 @@ def provider_factory(name: str | None = None) -> Provider:
         model = os.getenv("ABB_LLM_MODEL", "deepseek-chat")
         api_key = os.getenv("ABB_LLM_API_KEY", "")
         network_enabled = os.getenv("ABB_LLM_NETWORK_ENABLED", "false").lower() == "true"
+        raw_timeout = os.getenv("ABB_LLM_TIMEOUT_SECONDS", "30")
+        try:
+            timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ABB_LLM_TIMEOUT_SECONDS must be a finite positive number") from exc
         return OpenAICompatibleProvider(
             base_url=base_url,
             model=model,
@@ -402,6 +412,7 @@ def provider_factory(name: str | None = None) -> Provider:
             network_enabled=network_enabled,
             input_price_per_million=_optional_float(os.getenv("ABB_LLM_INPUT_PRICE_PER_MILLION")),
             output_price_per_million=_optional_float(os.getenv("ABB_LLM_OUTPUT_PRICE_PER_MILLION")),
+            timeout_seconds=timeout_seconds,
         )
     raise ValueError(f"Unknown provider: {name}")
 
