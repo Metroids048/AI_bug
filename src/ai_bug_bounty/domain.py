@@ -470,6 +470,9 @@ class ExperimentBatch(StrictModel):
     run_ids: list[str] = Field(default_factory=list)
     status: ExperimentBatchStatus = ExperimentBatchStatus.RUNNING
     failure_code: str | None = None
+    failure_stage: str | None = None
+    failure_http_status: int | None = None
+    failure_retry_after: str | None = None
     created_at: datetime = Field(default_factory=now_utc)
     completed_at: datetime | None = None
 

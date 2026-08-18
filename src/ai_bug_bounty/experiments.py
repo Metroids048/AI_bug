@@ -32,7 +32,7 @@ from .domain import (
 )
 from .lab import LocalLabExecutor
 from .policy import ScopeGuard
-from .providers import Provider
+from .providers import Provider, ProviderCallError
 from .storage import Repository
 from .workflow import PlanContractViolation, Planner, ResearchOrchestrator, validate_benchmark_plan
 
@@ -125,7 +125,13 @@ class ExperimentRunner:
                 results.append(run)
         except Exception as exc:
             batch.status = ExperimentBatchStatus.FAILED
-            batch.failure_code = type(exc).__name__
+            if isinstance(exc, ProviderCallError):
+                batch.failure_code = exc.reason_code
+                batch.failure_stage = exc.stage
+                batch.failure_http_status = exc.http_status
+                batch.failure_retry_after = exc.retry_after
+            else:
+                batch.failure_code = type(exc).__name__
             batch.completed_at = datetime.now(UTC)
             self.repository.save("experiment_batch", batch, program.id, "EXPERIMENT_BATCH_FAILED")
             raise

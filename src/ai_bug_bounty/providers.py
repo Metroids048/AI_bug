@@ -28,6 +28,53 @@ class ProviderDisabled(RuntimeError):
     pass
 
 
+class ProviderCallError(RuntimeError):
+    """Sanitized, deterministic failure contract for one provider call."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        reason_code: str,
+        http_status: int | None = None,
+        retry_after: str | None = None,
+    ):
+        self.stage = stage
+        self.reason_code = reason_code
+        self.http_status = http_status
+        self.retry_after = retry_after
+        status = f" status={http_status}" if http_status is not None else ""
+        super().__init__(f"{reason_code} at {stage}{status}")
+
+
+def _classify_provider_error(stage: str, exc: Exception) -> ProviderCallError:
+    if isinstance(exc, httpx.TimeoutException):
+        return ProviderCallError(stage=stage, reason_code="PROVIDER_TIMEOUT")
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        status = response.status_code if response is not None else None
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if status in {401, 403}:
+            reason_code = "PROVIDER_AUTH"
+        elif status == 429:
+            reason_code = "PROVIDER_RATE_LIMIT"
+        elif status is not None and 400 <= status < 500:
+            reason_code = "PROVIDER_REQUEST_REJECTED"
+        elif status is not None and 500 <= status < 600:
+            reason_code = "PROVIDER_UPSTREAM"
+        else:
+            reason_code = "PROVIDER_HTTP_ERROR"
+        return ProviderCallError(
+            stage=stage,
+            reason_code=reason_code,
+            http_status=status,
+            retry_after=retry_after,
+        )
+    if isinstance(exc, httpx.RequestError):
+        return ProviderCallError(stage=stage, reason_code="PROVIDER_NETWORK")
+    raise exc
+
+
 @dataclass
 class ProviderResult:
     data: BaseModel
@@ -343,7 +390,12 @@ class OpenAICompatibleProvider(Provider):
             schema_definition = _without_benchmark_oracle_fields(schema_definition)
         schema_json = json.dumps(schema_definition, sort_keys=True)
         prompt = self._prompt(task, context, schema_json)
-        _, content, usage = self._request(prompt, schema, schema_definition)
+        try:
+            _, content, usage = self._request(prompt, schema, schema_definition)
+        except ProviderCallError:
+            raise
+        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+            raise _classify_provider_error(task, exc) from exc
         try:
             result = schema.model_validate_json(content)
         except Exception as first_error:
@@ -354,7 +406,12 @@ class OpenAICompatibleProvider(Provider):
                 repair=f"The previous JSON failed schema validation: {str(first_error)[:1000]}",
                 previous_response=content,
             )
-            _, repair_content, repair_usage = self._request(repair_prompt, schema, schema_definition)
+            try:
+                _, repair_content, repair_usage = self._request(repair_prompt, schema, schema_definition)
+            except ProviderCallError:
+                raise
+            except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+                raise _classify_provider_error(task, exc) from exc
             usage = _merge_usage(usage, repair_usage)
             try:
                 result = schema.model_validate_json(repair_content)
@@ -424,7 +481,11 @@ class OpenAICompatibleProvider(Provider):
         # Mock transports may not attach a Request object; status-code gating
         # preserves the HTTP error behavior without requiring that metadata.
         if response.status_code >= 400:
-            response.raise_for_status()
+            try:
+                request = response.request
+            except RuntimeError:
+                request = httpx.Request("POST", f"{self.base_url}/chat/completions")
+            raise httpx.HTTPStatusError("provider returned an HTTP error", request=request, response=response)
         payload = response.json()
         content = _clean_json_content(payload["choices"][0]["message"]["content"])
         return payload, content, payload.get("usage", {})

@@ -7,7 +7,7 @@ from ai_bug_bounty.benchmark_contracts import MODEL_INTERFACE_VERSION
 from ai_bug_bounty.experiments import benchmark_version
 from ai_bug_bounty.lab import benchmark_profile
 from ai_bug_bounty.programs import authorize_program, create_benchmark_program
-from ai_bug_bounty.providers import BlindBenchmarkProvider, OpenAICompatibleProvider
+from ai_bug_bounty.providers import BlindBenchmarkProvider, OpenAICompatibleProvider, ProviderCallError
 from ai_bug_bounty.storage import Repository
 from ai_bug_bounty.workflow import PlanContractViolation, Planner
 
@@ -142,3 +142,57 @@ def test_model_interface_version_is_part_of_benchmark_hash(monkeypatch):
     assert MODEL_INTERFACE_VERSION == "v1"
     monkeypatch.setattr(experiments, "MODEL_INTERFACE_VERSION", "v2")
     assert benchmark_version() != baseline
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_reason"),
+    [
+        (401, "PROVIDER_AUTH"),
+        (403, "PROVIDER_AUTH"),
+        (429, "PROVIDER_RATE_LIMIT"),
+        (400, "PROVIDER_REQUEST_REJECTED"),
+        (503, "PROVIDER_UPSTREAM"),
+    ],
+)
+def test_provider_http_failures_are_classified_without_retry(monkeypatch, status_code, expected_reason):
+    calls = 0
+
+    def fake_post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        response = httpx.Response(status_code, headers={"Retry-After": "7"})
+        request = httpx.Request("POST", "http://model.local/v1/chat/completions")
+        raise httpx.HTTPStatusError("request failed", request=request, response=response)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        provider.plan("program", "lab://idor")
+
+    assert calls == 1
+    assert exc_info.value.reason_code == expected_reason
+    assert exc_info.value.stage == "planner"
+    assert exc_info.value.http_status == status_code
+    assert exc_info.value.retry_after == "7"
+
+
+def test_provider_timeout_is_classified_without_retry(monkeypatch):
+    calls = 0
+
+    def fake_post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        provider.plan("program", "lab://idor")
+
+    assert calls == 1
+    assert exc_info.value.reason_code == "PROVIDER_TIMEOUT"
+    assert exc_info.value.stage == "planner"
+    assert exc_info.value.http_status is None
+    assert exc_info.value.retry_after is None

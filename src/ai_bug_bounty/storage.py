@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from .benchmark_contracts import BatchIntegrityValidator
+from .benchmark_contracts import BatchIntegrityValidator, canonical_case_outcome
 from .domain import (
     AuditEvent,
     CostEntry,
@@ -300,9 +300,16 @@ class Repository:
             runs = [item for item in all_runs if program_id is None or item.program_id == program_id]
             cases = [item for item in all_cases if program_id is None or item.program_id == program_id]
             integrity = BatchIntegrityValidator(None, runs, cases).validate()
-        tp = sum(item.true_positive for item in cases)
-        fp = sum(item.false_positive for item in cases)
-        fn = sum(item.false_negative for item in cases)
+        gate_failures: list[str] = list(integrity.failures)
+        canonical_outcomes: dict[str, Any] = {}
+        for item in cases:
+            try:
+                canonical_outcomes[item.id] = canonical_case_outcome(item)
+            except KeyError:
+                gate_failures.append("unknown_scenario")
+        tp = sum(outcome.true_positive for outcome in canonical_outcomes.values())
+        fp = sum(outcome.false_positive for outcome in canonical_outcomes.values())
+        fn = sum(outcome.false_negative for outcome in canonical_outcomes.values())
         contract_failures = sum(not item.contract_valid for item in cases)
         semantic_contract_failures = sum(not item.semantic_contract_valid for item in cases)
         known_cost = sum(item.known_cost for item in runs)
@@ -313,9 +320,11 @@ class Repository:
         scenario_hits: dict[str, int] = {}
         scenario_runs: dict[str, int] = {}
         for item in cases:
+            outcome = canonical_outcomes.get(item.id)
+            if outcome is None:
+                continue
             scenario_runs[item.scenario_key] = scenario_runs.get(item.scenario_key, 0) + 1
-            scenario_hits[item.scenario_key] = scenario_hits.get(item.scenario_key, 0) + int(item.true_positive)
-        gate_failures: list[str] = list(integrity.failures)
+            scenario_hits[item.scenario_key] = scenario_hits.get(item.scenario_key, 0) + int(outcome.true_positive)
         if len(runs) < 3 or not cases:
             gate_failures.append("insufficient_rounds")
         if any(item.experiment_batch_id is None for item in runs):
@@ -328,7 +337,11 @@ class Repository:
             gate_failures.append("false_positive")
         if contract_failures:
             gate_failures.append("plan_contract_violation")
-        truth_paths = {item.scenario_key for item in cases if item.truth_vulnerable}
+        truth_paths = {
+            item.scenario_key
+            for item in cases
+            if (outcome := canonical_outcomes.get(item.id)) is not None and outcome.truth_vulnerable
+        }
         if any(
             scenario_hits.get(path, 0) < (scenario_runs.get(path, 0) // 2 + 1)
             for path in truth_paths

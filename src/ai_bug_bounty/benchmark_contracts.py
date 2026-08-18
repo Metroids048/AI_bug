@@ -6,7 +6,15 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from .domain import ExperimentBatch, ExperimentCaseResult, ExperimentRun, Observation, TargetProfile, ValidationPlan
+from .domain import (
+    ExperimentBatch,
+    ExperimentCaseResult,
+    ExperimentRun,
+    Observation,
+    ResearchState,
+    TargetProfile,
+    ValidationPlan,
+)
 
 BENCHMARK_CONTRACT_VERSION = "M2.6.4"
 SEMANTIC_ASSERTION_VERSION = "v2"
@@ -150,6 +158,29 @@ class BatchIntegrityResult:
     failures: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class CanonicalCaseOutcome:
+    truth_vulnerable: bool
+    scenario_class: str
+    true_positive: bool
+    false_positive: bool
+    false_negative: bool
+
+
+def canonical_case_outcome(case: ExperimentCaseResult) -> CanonicalCaseOutcome:
+    """Derive benchmark scoring from canonical maps and final finding state only."""
+    truth_vulnerable = SCENARIO_TRUTH[case.scenario_key]
+    scenario_class = SCENARIO_CLASS[case.scenario_key]
+    ready = case.finding_state == ResearchState.SUBMISSION_READY
+    return CanonicalCaseOutcome(
+        truth_vulnerable=truth_vulnerable,
+        scenario_class=scenario_class,
+        true_positive=truth_vulnerable and ready,
+        false_positive=(not truth_vulnerable) and ready,
+        false_negative=truth_vulnerable and not ready,
+    )
+
+
 class BatchIntegrityValidator:
     """Validate one exact batch identity before any metric can pass the Gate."""
 
@@ -215,6 +246,21 @@ class BatchIntegrityValidator:
                     or case.program_id != batch.program_id
                 ):
                     failures.append("foreign_case")
+                try:
+                    canonical = canonical_case_outcome(case)
+                except KeyError:
+                    failures.append("unknown_scenario")
+                    continue
+                if case.truth_vulnerable != canonical.truth_vulnerable:
+                    failures.append("scenario_truth_mismatch")
+                if case.scenario_class != canonical.scenario_class:
+                    failures.append("scenario_class_mismatch")
+                if (
+                    case.true_positive != canonical.true_positive
+                    or case.false_positive != canonical.false_positive
+                    or case.false_negative != canonical.false_negative
+                ):
+                    failures.append("case_metric_mismatch")
 
         if len(round_numbers) != len(set(round_numbers)):
             failures.append("duplicate_round")
