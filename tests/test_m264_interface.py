@@ -8,7 +8,15 @@ from ai_bug_bounty.experiments import benchmark_version
 from ai_bug_bounty.lab import benchmark_profile
 from ai_bug_bounty.programs import authorize_program, create_benchmark_program
 from ai_bug_bounty.providers import BlindBenchmarkProvider, OpenAICompatibleProvider
+from ai_bug_bounty.storage import Repository
 from ai_bug_bounty.workflow import PlanContractViolation, Planner
+
+
+@pytest.fixture
+def repo(tmp_path):
+    repository = Repository(tmp_path / "test.sqlite3")
+    yield repository
+    repository.close()
 
 
 def _authorized_benchmark(repo):
@@ -111,8 +119,19 @@ def test_benchmark_planner_prompt_requires_exact_public_operation_coverage(monke
     assert "Preserve each operation's method and path exactly." in prompt
     assert "Do not omit, duplicate, merge, invent, rank away, or replace operations." in prompt
     assert "This requirement describes experiment coverage only." in prompt
-    assert "GET /api/example" in prompt
-    for marker in ("truth_vulnerable", "scenario_truth", "expected_status", "semantic_assertion"):
+    assert '"method": "GET"' in prompt
+    assert '"path": "/api/example"' in prompt
+    for marker in (
+        "truth_vulnerable",
+        "scenario_truth",
+        "expected_status",
+        "expected_result",
+        "should_pass",
+        "should_fail",
+        "semantic_assertion",
+        "semantic_contract",
+        "hidden_assertion",
+    ):
         assert marker not in prompt.lower()
 
 

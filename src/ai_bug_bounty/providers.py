@@ -64,6 +64,38 @@ class DeterministicProvider(Provider):
     model = "offline-rules-v1"
 
     def plan(self, program_id: str, asset: str, context: dict[str, Any] | None = None) -> ProviderResult:
+        if asset == "lab://benchmark" and context and context.get("operations"):
+            candidates = [
+                BenchmarkHypothesis(
+                    program_id=program_id,
+                    target_profile_id=context.get("target_profile_id"),
+                    asset=asset,
+                    category="authorization",
+                    feature=f"{operation['method']} {operation['path']}",
+                    operation_method=operation["method"],
+                    operation_path=operation["path"],
+                    expected_security_boundary="The documented operation should respect its stated security boundary.",
+                    hypothesis="The operation may behave differently from its documented security boundary.",
+                    reason=f"Public operation description: {operation.get('description', '')}",
+                    validation_plan="Compare a control and test response.",
+                    required_accounts=["account_a", "account_b"],
+                    confidence=0.5,
+                    potential_impact=1,
+                    testability=1,
+                    scope_confidence=1,
+                    duplicate_risk=0.9,
+                    source="deterministic-fixture",
+                )
+                for operation in context["operations"]
+            ]
+            return ProviderResult(
+                BenchmarkHypothesisBatch(hypotheses=candidates),
+                self.name,
+                self.model,
+                ProviderUsage(input_tokens=0, output_tokens=0),
+                0.0,
+                0.0,
+            )
         common = {
             "program_id": program_id,
             "asset": asset,
@@ -342,13 +374,30 @@ class OpenAICompatibleProvider(Provider):
         repair: str | None = None,
         previous_response: str | None = None,
     ) -> str:
+        prompt_context = dict(context)
+        coverage_repair = prompt_context.pop("_benchmark_coverage_repair", None)
         lines = [
             "Return exactly one JSON object and no Markdown.",
             "Use only facts from Context; do not invent scope, accounts, observations, or business rules.",
             f"Task: {task}",
             f"JSON Schema: {schema_json}",
-            f"Context: {json.dumps(context, sort_keys=True)}",
         ]
+        if task == "planner" and prompt_context.get("asset") == "lab://benchmark":
+            lines.extend([
+                "For the benchmark, return exactly one hypothesis for every public operation in Context.operations.",
+                "Preserve each operation's method and path exactly.",
+                "Do not omit, duplicate, merge, invent, rank away, or replace operations.",
+                "This requirement describes experiment coverage only.",
+                "It does not imply that any operation is vulnerable.",
+            ])
+        lines.append(f"Context: {json.dumps(prompt_context, sort_keys=True)}")
+        if coverage_repair:
+            lines.extend([
+                "Structural coverage repair diagnostics (operation identities only):",
+                f"Missing operation identities: {json.dumps(coverage_repair.get('missing', []), sort_keys=True)}",
+                f"Duplicate operation identities: {json.dumps(coverage_repair.get('duplicate', []), sort_keys=True)}",
+                f"Unknown operation identities: {json.dumps(coverage_repair.get('unknown', []), sort_keys=True)}",
+            ])
         if repair:
             lines.extend([repair, f"Previous response to repair: {previous_response or ''}"])
         return "\n".join(lines)

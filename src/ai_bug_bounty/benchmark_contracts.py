@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,7 @@ from .domain import ExperimentBatch, ExperimentCaseResult, ExperimentRun, Observ
 BENCHMARK_CONTRACT_VERSION = "M2.6.4"
 SEMANTIC_ASSERTION_VERSION = "v2"
 FIXTURE_VERSION = "v3"
+MODEL_INTERFACE_VERSION = "v1"
 
 SCENARIO_TRUTH: dict[str, bool] = {
     "/api/documents/{id}": True,
@@ -47,6 +49,92 @@ PUBLIC_OPERATION_MANIFEST: tuple[dict[str, str], ...] = (
     {"path": "/api/metadata/{id}", "method": "GET", "description": "Retrieve metadata associated with a resource."},
 )
 SCENARIO_MANIFEST = frozenset(SCENARIO_TRUTH)
+
+OperationIdentity = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class BenchmarkOperationCoverageResult:
+    expected_identities: tuple[OperationIdentity, ...]
+    returned_identities: tuple[OperationIdentity, ...]
+    missing: tuple[OperationIdentity, ...]
+    duplicate: tuple[OperationIdentity, ...]
+    unknown: tuple[OperationIdentity, ...]
+    expected_duplicate: tuple[OperationIdentity, ...]
+    valid: bool
+
+    @property
+    def expected_count(self) -> int:
+        return len(self.expected_identities)
+
+    @property
+    def returned_count(self) -> int:
+        return len(self.returned_identities)
+
+
+def _operation_identity(method: Any, path: Any) -> OperationIdentity:
+    return ("" if method is None else str(method), "" if path is None else str(path))
+
+
+def validate_benchmark_operation_coverage(
+    expected_operations: Iterable[dict[str, Any]], hypotheses: Iterable[Any]
+) -> BenchmarkOperationCoverageResult:
+    """Compare planner operation identities without evaluating vulnerability semantics."""
+    expected = tuple(
+        _operation_identity(item.get("method"), item.get("path"))
+        for item in expected_operations
+    )
+    returned = tuple(
+        _operation_identity(
+            item.get("operation_method"), item.get("operation_path")
+        )
+        if isinstance(item, dict)
+        else _operation_identity(getattr(item, "operation_method", None), getattr(item, "operation_path", None))
+        for item in hypotheses
+    )
+    expected_counts = Counter(expected)
+    returned_counts = Counter(returned)
+    missing = tuple(
+        sorted(
+            (identity for identity, count in expected_counts.items() if returned_counts[identity] < count),
+            key=lambda identity: (identity[1], identity[0]),
+        )
+    )
+    duplicate = tuple(
+        sorted(
+            (identity for identity, count in returned_counts.items() if count > 1),
+            key=lambda identity: (identity[1], identity[0]),
+        )
+    )
+    unknown = tuple(
+        sorted(
+            (identity for identity in returned_counts if identity not in expected_counts),
+            key=lambda identity: (identity[1], identity[0]),
+        )
+    )
+    expected_duplicate = tuple(
+        sorted(
+            (identity for identity, count in expected_counts.items() if count > 1),
+            key=lambda identity: (identity[1], identity[0]),
+        )
+    )
+    valid = (
+        len(expected) == 9
+        and len(returned) == 9
+        and not missing
+        and not duplicate
+        and not unknown
+        and not expected_duplicate
+    )
+    return BenchmarkOperationCoverageResult(
+        expected_identities=expected,
+        returned_identities=returned,
+        missing=missing,
+        duplicate=duplicate,
+        unknown=unknown,
+        expected_duplicate=expected_duplicate,
+        valid=valid,
+    )
 
 
 @dataclass(frozen=True)

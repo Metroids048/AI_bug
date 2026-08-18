@@ -9,6 +9,7 @@ from typing import Any
 from .benchmark_contracts import (
     BENCHMARK_CONTRACT_VERSION,
     FIXTURE_VERSION,
+    MODEL_INTERFACE_VERSION,
     PUBLIC_OPERATION_MANIFEST,
     SCENARIO_CLASS,
     SCENARIO_TRUTH,
@@ -51,6 +52,7 @@ def benchmark_version(operations: list[dict[str, Any]] | None = None) -> str:
         "contract": BENCHMARK_CONTRACT_VERSION,
         "semantic_assertion": SEMANTIC_ASSERTION_VERSION,
         "fixture": FIXTURE_VERSION,
+        "model_interface": MODEL_INTERFACE_VERSION,
         "scenario_manifest": sorted(SCENARIO_TRUTH),
         "operations": sorted(normalized, key=lambda item: (item["path"], item["method"])),
         "scenario_truth": SCENARIO_TRUTH,

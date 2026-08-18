@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from .benchmark_contracts import evaluate_semantic_observations, validate_semantic_plan
+from .benchmark_contracts import (
+    evaluate_semantic_observations,
+    validate_benchmark_operation_coverage,
+    validate_semantic_plan,
+)
 from .cost import record_usage
 from .domain import (
     ActionProposal,
@@ -136,6 +140,17 @@ def _provider_context(profile: TargetProfile | None) -> dict[str, Any]:
     }
 
 
+def _coverage_repair_context(coverage) -> dict[str, list[dict[str, str]]]:
+    def serialize(identities):
+        return [{"method": method, "path": path} for method, path in identities]
+
+    return {
+        "missing": serialize(coverage.missing),
+        "duplicate": serialize(coverage.duplicate),
+        "unknown": serialize(coverage.unknown),
+    }
+
+
 @dataclass
 class Planner:
     repository: Repository
@@ -153,6 +168,21 @@ class Planner:
             experiment_run_id=self.experiment_run_id,
         )
         hypotheses = result.data.hypotheses
+        if asset == "lab://benchmark":
+            coverage = validate_benchmark_operation_coverage(context.get("operations", []), hypotheses)
+            if not coverage.valid:
+                repair_context = dict(context)
+                repair_context["_benchmark_coverage_repair"] = _coverage_repair_context(coverage)
+                result = self.provider.plan(program.id, asset, repair_context)
+                record_usage(
+                    self.repository, result.provider, result.model, "planner", result.usage,
+                    result.input_price_per_million, result.output_price_per_million, program_id=program.id,
+                    experiment_run_id=self.experiment_run_id,
+                )
+                hypotheses = result.data.hypotheses
+                coverage = validate_benchmark_operation_coverage(context.get("operations", []), hypotheses)
+                if not coverage.valid:
+                    raise PlanContractViolation("BENCHMARK_OPERATION_COVERAGE_INVALID")
         if not 5 <= len(hypotheses) <= 20:
             raise ValueError("Planner must produce between 5 and 20 hypotheses.")
         for hypothesis in hypotheses:
