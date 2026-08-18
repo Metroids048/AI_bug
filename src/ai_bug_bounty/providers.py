@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -38,18 +39,20 @@ class ProviderCallError(RuntimeError):
         reason_code: str,
         http_status: int | None = None,
         retry_after: str | None = None,
+        attempts: int = 1,
     ):
         self.stage = stage
         self.reason_code = reason_code
         self.http_status = http_status
         self.retry_after = retry_after
+        self.attempts = attempts
         status = f" status={http_status}" if http_status is not None else ""
         super().__init__(f"{reason_code} at {stage}{status}")
 
 
-def _classify_provider_error(stage: str, exc: Exception) -> ProviderCallError:
+def _classify_provider_error(stage: str, exc: Exception, *, attempts: int = 1) -> ProviderCallError:
     if isinstance(exc, httpx.TimeoutException):
-        return ProviderCallError(stage=stage, reason_code="PROVIDER_TIMEOUT")
+        return ProviderCallError(stage=stage, reason_code="PROVIDER_TIMEOUT", attempts=attempts)
     if isinstance(exc, httpx.HTTPStatusError):
         response = exc.response
         status = response.status_code if response is not None else None
@@ -69,9 +72,10 @@ def _classify_provider_error(stage: str, exc: Exception) -> ProviderCallError:
             reason_code=reason_code,
             http_status=status,
             retry_after=retry_after,
+            attempts=attempts,
         )
     if isinstance(exc, httpx.RequestError):
-        return ProviderCallError(stage=stage, reason_code="PROVIDER_NETWORK")
+        return ProviderCallError(stage=stage, reason_code="PROVIDER_NETWORK", attempts=attempts)
     raise exc
 
 
@@ -369,9 +373,15 @@ class OpenAICompatibleProvider(Provider):
         input_price_per_million: float | None = None,
         output_price_per_million: float | None = None,
         timeout_seconds: float = 30.0,
+        transient_max_retries: int = 2,
+        transient_backoff_seconds: float = 2.0,
     ):
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be a finite positive number")
+        if not isinstance(transient_max_retries, int) or isinstance(transient_max_retries, bool) or transient_max_retries < 0:
+            raise ValueError("transient_max_retries must be a non-negative integer")
+        if not math.isfinite(transient_backoff_seconds) or transient_backoff_seconds < 0:
+            raise ValueError("transient_backoff_seconds must be finite and non-negative")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -379,6 +389,8 @@ class OpenAICompatibleProvider(Provider):
         self.input_price_per_million = input_price_per_million
         self.output_price_per_million = output_price_per_million
         self.timeout_seconds = timeout_seconds
+        self.transient_max_retries = transient_max_retries
+        self.transient_backoff_seconds = transient_backoff_seconds
 
     def _call(self, task: str, context: dict[str, Any], schema: type[T]) -> ProviderResult:
         if not self.network_enabled:
@@ -391,7 +403,7 @@ class OpenAICompatibleProvider(Provider):
         schema_json = json.dumps(schema_definition, sort_keys=True)
         prompt = self._prompt(task, context, schema_json)
         try:
-            _, content, usage = self._request(prompt, schema, schema_definition)
+            _, content, usage = self._request(task, prompt, schema, schema_definition)
         except ProviderCallError:
             raise
         except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
@@ -407,7 +419,7 @@ class OpenAICompatibleProvider(Provider):
                 previous_response=content,
             )
             try:
-                _, repair_content, repair_usage = self._request(repair_prompt, schema, schema_definition)
+                _, repair_content, repair_usage = self._request(task, repair_prompt, schema, schema_definition)
             except ProviderCallError:
                 raise
             except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
@@ -460,7 +472,11 @@ class OpenAICompatibleProvider(Provider):
         return "\n".join(lines)
 
     def _request(
-        self, prompt: str, schema: type[T], schema_definition: dict[str, Any] | None = None
+        self,
+        stage: str,
+        prompt: str,
+        schema: type[T],
+        schema_definition: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], str, dict[str, Any]]:
         request_json: dict[str, Any] = {
             "model": self.model,
@@ -472,23 +488,36 @@ class OpenAICompatibleProvider(Provider):
                 "type": "json_schema",
                 "json_schema": {"name": schema.__name__, "strict": True, "schema": schema_definition or schema.model_json_schema()},
             }
-        response = httpx.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json=request_json,
-            timeout=self.timeout_seconds,
-        )
-        # Mock transports may not attach a Request object; status-code gating
-        # preserves the HTTP error behavior without requiring that metadata.
-        if response.status_code >= 400:
+        attempts = 0
+        while True:
+            attempts += 1
             try:
-                request = response.request
-            except RuntimeError:
-                request = httpx.Request("POST", f"{self.base_url}/chat/completions")
-            raise httpx.HTTPStatusError("provider returned an HTTP error", request=request, response=response)
-        payload = response.json()
-        content = _clean_json_content(payload["choices"][0]["message"]["content"])
-        return payload, content, payload.get("usage", {})
+                response = httpx.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json=request_json,
+                    timeout=self.timeout_seconds,
+                )
+                # Mock transports may not attach a Request object; status-code gating
+                # preserves the HTTP error behavior without requiring that metadata.
+                if response.status_code >= 400:
+                    try:
+                        request = response.request
+                    except RuntimeError:
+                        request = httpx.Request("POST", f"{self.base_url}/chat/completions")
+                    raise httpx.HTTPStatusError("provider returned an HTTP error", request=request, response=response)
+                payload = response.json()
+                content = _clean_json_content(payload["choices"][0]["message"]["content"])
+                return payload, content, payload.get("usage", {})
+            except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None else None
+                transient = status in {502, 503, 504}
+                if transient and attempts <= self.transient_max_retries:
+                    delay = self.transient_backoff_seconds * (2 ** (attempts - 1))
+                    if delay:
+                        time.sleep(delay)
+                    continue
+                raise _classify_provider_error(stage, exc, attempts=attempts) from exc
 
     def plan(self, program_id: str, asset: str, context: dict[str, Any] | None = None) -> ProviderResult:
         schema = BenchmarkHypothesisBatch if asset == "lab://benchmark" else HypothesisBatch
@@ -520,6 +549,16 @@ def provider_factory(name: str | None = None) -> Provider:
             timeout_seconds = float(raw_timeout)
         except (TypeError, ValueError) as exc:
             raise ValueError("ABB_LLM_TIMEOUT_SECONDS must be a finite positive number") from exc
+        raw_retries = os.getenv("ABB_LLM_TRANSIENT_MAX_RETRIES", "2")
+        try:
+            transient_max_retries = int(raw_retries)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ABB_LLM_TRANSIENT_MAX_RETRIES must be a non-negative integer") from exc
+        raw_backoff = os.getenv("ABB_LLM_TRANSIENT_BACKOFF_SECONDS", "2")
+        try:
+            transient_backoff_seconds = float(raw_backoff)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ABB_LLM_TRANSIENT_BACKOFF_SECONDS must be finite and non-negative") from exc
         return OpenAICompatibleProvider(
             base_url=base_url,
             model=model,
@@ -528,6 +567,8 @@ def provider_factory(name: str | None = None) -> Provider:
             input_price_per_million=_optional_float(os.getenv("ABB_LLM_INPUT_PRICE_PER_MILLION")),
             output_price_per_million=_optional_float(os.getenv("ABB_LLM_OUTPUT_PRICE_PER_MILLION")),
             timeout_seconds=timeout_seconds,
+            transient_max_retries=transient_max_retries,
+            transient_backoff_seconds=transient_backoff_seconds,
         )
     raise ValueError(f"Unknown provider: {name}")
 

@@ -473,6 +473,7 @@ class ExperimentBatch(StrictModel):
     failure_stage: str | None = None
     failure_http_status: int | None = None
     failure_retry_after: str | None = None
+    failure_attempts: int | None = None
     created_at: datetime = Field(default_factory=now_utc)
     completed_at: datetime | None = None
 

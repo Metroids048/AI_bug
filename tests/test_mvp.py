@@ -607,16 +607,19 @@ def test_tampered_case_metrics_cannot_change_canonical_summary(repo):
     assert "case_metric_mismatch" in summary["gate_failures"]
 
 
-def test_runtime_failure_metadata_contract(repo):
+def test_runtime_failure_metadata_contract(repo, monkeypatch):
     created = create_benchmark_program(repo)
     program = authorize_program(repo, created.id, created.scope_hash())
     profile = benchmark_profile(program.id)
     provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    calls = 0
 
     def fail(*args, **kwargs):
-        response = httpx.Response(429, headers={"Retry-After": "7"})
-        request = httpx.Request("POST", "http://model.local/v1/chat/completions")
-        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, request=httpx.Request("POST", "http://model.local/v1/chat/completions"))
 
     import ai_bug_bounty.providers as providers_module
     original_post = providers_module.httpx.post
@@ -627,15 +630,17 @@ def test_runtime_failure_metadata_contract(repo):
     finally:
         providers_module.httpx.post = original_post
 
-    assert exc_info.value.reason_code == "PROVIDER_RATE_LIMIT"
+    assert calls == 3
+    assert exc_info.value.reason_code == "PROVIDER_UPSTREAM"
     assert exc_info.value.stage == "planner"
     batch = repo.experiment_list(program.id)[0]
     assert batch.status == ExperimentBatchStatus.FAILED
     assert batch.completed_at is not None
-    assert batch.failure_code == "PROVIDER_RATE_LIMIT"
+    assert batch.failure_code == "PROVIDER_UPSTREAM"
     assert batch.failure_stage == "planner"
-    assert batch.failure_http_status == 429
-    assert batch.failure_retry_after == "7"
+    assert batch.failure_http_status == 503
+    assert batch.failure_retry_after is None
+    assert batch.failure_attempts == 3
 
 
 def test_summary_without_batch_id_cannot_pass_gate(repo):

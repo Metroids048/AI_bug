@@ -7,7 +7,12 @@ from ai_bug_bounty.benchmark_contracts import MODEL_INTERFACE_VERSION
 from ai_bug_bounty.experiments import benchmark_version
 from ai_bug_bounty.lab import benchmark_profile
 from ai_bug_bounty.programs import authorize_program, create_benchmark_program
-from ai_bug_bounty.providers import BlindBenchmarkProvider, OpenAICompatibleProvider, ProviderCallError
+from ai_bug_bounty.providers import (
+    BlindBenchmarkProvider,
+    DeterministicProvider,
+    OpenAICompatibleProvider,
+    ProviderCallError,
+)
 from ai_bug_bounty.storage import Repository
 from ai_bug_bounty.workflow import PlanContractViolation, Planner
 
@@ -151,7 +156,6 @@ def test_model_interface_version_is_part_of_benchmark_hash(monkeypatch):
         (403, "PROVIDER_AUTH"),
         (429, "PROVIDER_RATE_LIMIT"),
         (400, "PROVIDER_REQUEST_REJECTED"),
-        (503, "PROVIDER_UPSTREAM"),
     ],
 )
 def test_provider_http_failures_are_classified_without_retry(monkeypatch, status_code, expected_reason):
@@ -175,6 +179,7 @@ def test_provider_http_failures_are_classified_without_retry(monkeypatch, status
     assert exc_info.value.stage == "planner"
     assert exc_info.value.http_status == status_code
     assert exc_info.value.retry_after == "7"
+    assert exc_info.value.attempts == 1
 
 
 def test_provider_timeout_is_classified_without_retry(monkeypatch):
@@ -196,3 +201,98 @@ def test_provider_timeout_is_classified_without_retry(monkeypatch):
     assert exc_info.value.stage == "planner"
     assert exc_info.value.http_status is None
     assert exc_info.value.retry_after is None
+    assert exc_info.value.attempts == 1
+
+
+def _queued_provider_response(status_code, payload=None):
+    request = httpx.Request("POST", "http://model.local/v1/chat/completions")
+    if payload is None:
+        return httpx.Response(status_code, request=request)
+    return httpx.Response(status_code, request=request, json=payload)
+
+
+@pytest.mark.parametrize("transient_status", [502, 503, 504])
+def test_provider_retries_transient_upstream_then_succeeds(monkeypatch, transient_status):
+    fixture = DeterministicProvider().plan("program", "lab://idor")
+    payload = {"choices": [{"message": {"content": fixture.data.model_dump_json()}}], "usage": {}}
+    responses = [_queued_provider_response(transient_status), _queued_provider_response(200, payload)]
+    calls = 0
+    delays = []
+    monkeypatch.setattr("time.sleep", lambda delay: delays.append(delay))
+
+    def fake_post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return responses.pop(0)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+
+    result = provider.plan("program", "lab://idor")
+
+    assert result.data == fixture.data
+    assert calls == 2
+    assert delays == [2.0]
+
+
+def test_provider_retries_503_twice_then_succeeds(monkeypatch):
+    fixture = DeterministicProvider().plan("program", "lab://idor")
+    payload = {"choices": [{"message": {"content": fixture.data.model_dump_json()}}], "usage": {}}
+    responses = [_queued_provider_response(503), _queued_provider_response(503), _queued_provider_response(200, payload)]
+    calls = 0
+    delays = []
+    monkeypatch.setattr("time.sleep", lambda delay: delays.append(delay))
+
+    def fake_post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return responses.pop(0)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+
+    result = provider.plan("program", "lab://idor")
+
+    assert result.data == fixture.data
+    assert calls == 3
+    assert delays == [2.0, 4.0]
+
+
+def test_provider_stops_after_two_transient_retries(monkeypatch):
+    calls = 0
+    delays = []
+    monkeypatch.setattr("time.sleep", lambda delay: delays.append(delay))
+
+    def fake_post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _queued_provider_response(503)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+
+    with pytest.raises(ProviderCallError) as exc_info:
+        provider.plan("program", "lab://idor")
+
+    assert calls == 3
+    assert delays == [2.0, 4.0]
+    assert exc_info.value.reason_code == "PROVIDER_UPSTREAM"
+    assert exc_info.value.attempts == 3
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 429])
+def test_non_transient_provider_http_failures_are_not_retried(monkeypatch, status_code):
+    calls = 0
+
+    def fake_post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _queued_provider_response(status_code)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+
+    with pytest.raises(ProviderCallError):
+        provider.plan("program", "lab://idor")
+
+    assert calls == 1

@@ -130,6 +130,7 @@ class ExperimentRunner:
                 batch.failure_stage = exc.stage
                 batch.failure_http_status = exc.http_status
                 batch.failure_retry_after = exc.retry_after
+                batch.failure_attempts = exc.attempts
             else:
                 batch.failure_code = type(exc).__name__
             batch.completed_at = datetime.now(UTC)
