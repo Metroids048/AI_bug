@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import json
+import runpy
 import socket
+from pathlib import Path
 
 import httpx
 import pytest
+from typer.testing import CliRunner
 
+from ai_bug_bounty.cli import app
 from ai_bug_bounty.cost import record_usage
 from ai_bug_bounty.domain import (
     ActionProposal,
     Decision,
     Evidence,
+    ExperimentBatch,
+    ExperimentBatchStatus,
+    ExperimentCaseResult,
+    ExperimentRun,
     Finding,
     Hypothesis,
     Observation,
@@ -41,6 +49,8 @@ from ai_bug_bounty.reporting import ReportService
 from ai_bug_bounty.state import InvalidTransition, transition_research
 from ai_bug_bounty.storage import Repository
 from ai_bug_bounty.workflow import Planner, ResearchOrchestrator, _provider_context
+
+check_freshness = runpy.run_path(Path(__file__).parents[1] / "scripts" / "check_acceptance_freshness.py")["check_freshness"]
 
 
 @pytest.fixture
@@ -385,7 +395,7 @@ def test_m26_three_round_nine_case_metrics_and_no_oracle_context(repo, monkeypat
     monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
     runs = ExperimentRunner(repo, BlindBenchmarkProvider()).run(program, profile, rounds=3)
     assert len(runs) == 3
-    summary = repo.experiment_summary(program.id)
+    summary = repo.experiment_summary(batch_id=runs[0].experiment_batch_id)
     assert summary["case_runs"] == 27
     assert summary["true_positive"] == 9
     assert summary["false_positive"] == 0
@@ -434,6 +444,63 @@ def test_program_summary_requires_explicit_batch_when_multiple_exist(repo):
         repo.experiment_summary(program_id="p")
 
 
+def _save_cli_batches(db, *program_ids: str) -> None:
+    from ai_bug_bounty.domain import ExperimentBatch, ExperimentBatchStatus
+
+    repository = Repository(db)
+    for program_id in program_ids:
+        repository.save(
+            "experiment_batch",
+            ExperimentBatch(
+                program_id=program_id,
+                provider="blind-benchmark",
+                model="offline-blind-v1",
+                benchmark_version="v1",
+                requested_rounds=1,
+                run_ids=[],
+                status=ExperimentBatchStatus.COMPLETED,
+            ),
+            program_id,
+        )
+    repository.close()
+
+
+def _assert_cli_summary_error(result):
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "experiment-list" in result.output
+    assert "--batch-id" in result.output
+
+
+def test_cli_experiment_summary_handles_multiple_batches(tmp_path):
+    db = tmp_path / "multiple.sqlite3"
+    _save_cli_batches(db, "program-a", "program-a")
+    result = CliRunner().invoke(app, ["experiment-summary", "--program-id", "program-a", "--db", str(db)])
+    _assert_cli_summary_error(result)
+
+
+def test_cli_experiment_summary_handles_unknown_batch(tmp_path):
+    db = tmp_path / "unknown.sqlite3"
+    result = CliRunner().invoke(app, ["experiment-summary", "--program-id", "program-a", "--batch-id", "missing", "--db", str(db)])
+    _assert_cli_summary_error(result)
+
+
+def test_cli_experiment_summary_handles_batch_from_other_program(tmp_path):
+    db = tmp_path / "wrong-program.sqlite3"
+    _save_cli_batches(db, "program-a")
+    repository = Repository(db)
+    batch_id = repository.experiment_list("program-a")[0].id
+    repository.close()
+    result = CliRunner().invoke(app, ["experiment-summary", "--program-id", "program-b", "--batch-id", batch_id, "--db", str(db)])
+    _assert_cli_summary_error(result)
+
+
+def test_acceptance_freshness_warns_when_recorded_commit_differs():
+    acceptance = "## Verification Result\n- Verification commit: `dead123`\n"
+    warning = check_freshness(acceptance, "beef567")
+    assert warning == "WARNING: ACCEPTANCE.md may be stale: recorded commit dead123, current HEAD beef567."
+
+
 def test_legacy_unbatched_runs_are_readable_but_not_gate_eligible(repo):
     from ai_bug_bounty.domain import ExperimentRun
     run = ExperimentRun(program_id="p", provider="legacy", model="m", round_number=1, context_hash="h", total_cases=0)
@@ -442,6 +509,256 @@ def test_legacy_unbatched_runs_are_readable_but_not_gate_eligible(repo):
     assert summary["runs"] == 1
     assert summary["gate_passed"] is False
     assert "legacy_unbatched" in summary["gate_failures"]
+
+
+def _integrity_batch(repo, *, requested_rounds=3, completed_rounds=None, status=ExperimentBatchStatus.COMPLETED, cases_per_run=9):
+    batch = ExperimentBatch(
+        program_id="integrity-program",
+        provider="blind-benchmark",
+        model="offline-blind-v1",
+        benchmark_version="M2.6.4-test",
+        requested_rounds=requested_rounds,
+        status=status,
+    )
+    repo.save("experiment_batch", batch, batch.program_id)
+    scenario_keys = [
+        "/api/documents/{id}", "/api/items/{id}", "/api/environment",
+        "/api/environment/details", "/api/promotions/apply", "/api/promotions/submit",
+        "/api/users/{id}", "/api/records/{id}", "/api/metadata/{id}",
+    ]
+    for round_number in range(1, (completed_rounds if completed_rounds is not None else requested_rounds) + 1):
+        run = ExperimentRun(
+            experiment_batch_id=batch.id,
+            program_id=batch.program_id,
+            provider=batch.provider,
+            model=batch.model,
+            round_number=round_number,
+            context_hash=f"context-{round_number}",
+            scenario_order=scenario_keys[:cases_per_run],
+            total_cases=cases_per_run,
+            completed_at=None if status == ExperimentBatchStatus.RUNNING else __import__("datetime").datetime.now(__import__("datetime").UTC),
+        )
+        repo.save("experiment_run", run, batch.program_id)
+        batch.run_ids.append(run.id)
+        for scenario_key in scenario_keys[:cases_per_run]:
+            repo.save(
+                "experiment_case_result",
+                ExperimentCaseResult(
+                    experiment_run_id=run.id,
+                    experiment_batch_id=batch.id,
+                    program_id=batch.program_id,
+                    scenario_key=scenario_key,
+                    scenario_class="authorization",
+                    truth_vulnerable=False,
+                    reproductions=2,
+                    evidence_complete=True,
+                ),
+                batch.program_id,
+            )
+    repo.save("experiment_batch", batch, batch.program_id)
+    return batch
+
+
+def test_summary_without_batch_id_cannot_pass_gate(repo):
+    batch = _integrity_batch(repo)
+    summary = repo.experiment_summary(program_id=batch.program_id)
+    assert summary["batch_id"] is None
+    assert summary["gate_passed"] is False
+    assert "missing_batch_id" in summary["gate_failures"]
+
+
+def test_running_batch_cannot_pass_gate(repo):
+    batch = _integrity_batch(repo, status=ExperimentBatchStatus.RUNNING)
+    summary = repo.experiment_summary(batch_id=batch.id)
+    assert summary["gate_passed"] is False
+    assert "batch_not_completed" in summary["gate_failures"]
+
+
+def test_requested_rounds_mismatch_cannot_pass_gate(repo):
+    batch = _integrity_batch(repo, requested_rounds=5, completed_rounds=3)
+    summary = repo.experiment_summary(batch_id=batch.id)
+    assert summary["gate_passed"] is False
+    assert "round_count_mismatch" in summary["gate_failures"]
+
+
+def test_incomplete_run_cannot_pass_gate(repo):
+    batch = _integrity_batch(repo)
+    run = repo.get("experiment_run", batch.run_ids[0], ExperimentRun)
+    assert run
+    run.completed_at = None
+    repo.save("experiment_run", run, batch.program_id)
+    summary = repo.experiment_summary(batch_id=batch.id)
+    assert summary["gate_passed"] is False
+    assert "incomplete_run" in summary["gate_failures"]
+
+
+def test_run_with_missing_case_cannot_pass_gate(repo):
+    batch = _integrity_batch(repo, cases_per_run=8)
+    summary = repo.experiment_summary(batch_id=batch.id)
+    assert summary["gate_passed"] is False
+    assert "scenario_count_mismatch" in summary["gate_failures"]
+    assert "missing_scenario" in summary["gate_failures"]
+
+
+def test_duplicate_scenario_cannot_pass_gate(repo):
+    batch = _integrity_batch(repo)
+    case = repo.list("experiment_case_result", ExperimentCaseResult, batch.program_id)[0]
+    duplicate = case.model_copy(update={"scenario_key": "/api/items/{id}"})
+    repo.save("experiment_case_result", duplicate, batch.program_id)
+    summary = repo.experiment_summary(batch_id=batch.id)
+    assert summary["gate_passed"] is False
+    assert "duplicate_scenario" in summary["gate_failures"]
+
+
+def test_foreign_run_cannot_be_borrowed(repo):
+    first = _integrity_batch(repo)
+    second = _integrity_batch(repo)
+    first.run_ids.append(second.run_ids[0])
+    repo.save("experiment_batch", first, first.program_id)
+    summary = repo.experiment_summary(batch_id=first.id)
+    assert summary["gate_passed"] is False
+    assert "foreign_run" in summary["gate_failures"]
+
+
+def test_foreign_case_cannot_be_borrowed(repo):
+    first = _integrity_batch(repo)
+    second = _integrity_batch(repo)
+    case = repo.list("experiment_case_result", ExperimentCaseResult, first.program_id)[0]
+    foreign = case.model_copy(update={"experiment_batch_id": second.id})
+    repo.save("experiment_case_result", foreign, first.program_id)
+    summary = repo.experiment_summary(batch_id=first.id)
+    assert summary["gate_passed"] is False
+    assert "foreign_case" in summary["gate_failures"]
+
+
+def _semantic_plan_for(path, *, control_account="account_a", test_account="account_b", control_target=None, test_target=None, code="WELCOME", test_code=None):
+    target = control_target or f"lab://benchmark{ {'/api/documents/{id}': '/api/documents/doc-a', '/api/items/{id}': '/api/items/item-a', '/api/environment': '/api/environment', '/api/environment/details': '/api/environment/details', '/api/promotions/apply': '/api/promotions/apply', '/api/promotions/submit': '/api/promotions/submit'}[path] }"
+    test_target = test_target or target
+    business = path.startswith("/api/promotions/")
+    method = "POST" if business else "GET"
+    return ValidationPlan(
+        hypothesis_id="semantic-h",
+        objective="test",
+        steps=[
+            ValidationStep(phase="CONTROL", target=target, method=method, action="WRITE_TEST_DATA" if business else "READ", account_role=control_account, resource_key="document_a" if "documents" in path else path, expected_behavior="control", request_payload={"code": code} if business else None),
+            ValidationStep(phase="TEST", target=test_target, method=method, action="WRITE_TEST_DATA" if business else "READ", account_role=test_account, resource_key="document_a" if "documents" in path else path, expected_behavior="test", request_payload={"code": test_code if test_code is not None else code} if business else None),
+        ],
+    )
+
+
+def test_same_account_fake_idor_is_semantic_failure():
+    from ai_bug_bounty.benchmark_contracts import validate_semantic_plan
+    plan = _semantic_plan_for("/api/documents/{id}", test_account="account_a")
+    assert validate_semantic_plan("/api/documents/{id}", plan, benchmark_profile("p")) == "TEST_ACCOUNT_NOT_DISTINCT"
+
+
+def test_different_resource_fake_idor_is_semantic_failure():
+    from ai_bug_bounty.benchmark_contracts import validate_semantic_plan
+    plan = _semantic_plan_for("/api/documents/{id}", test_target="lab://benchmark/api/documents/doc-b")
+    assert validate_semantic_plan("/api/documents/{id}", plan, benchmark_profile("p")) == "RESOURCE_NOT_IDENTICAL"
+
+
+def test_different_promotion_code_is_not_replay():
+    from ai_bug_bounty.benchmark_contracts import validate_semantic_plan
+    plan = _semantic_plan_for("/api/promotions/apply", test_account="account_a", test_code="SUMMER20")
+    assert validate_semantic_plan("/api/promotions/apply", plan, benchmark_profile("p")) == "PROMOTION_CODE_NOT_IDENTICAL"
+
+
+def test_different_account_business_plan_is_semantic_failure():
+    from ai_bug_bounty.benchmark_contracts import validate_semantic_plan
+    plan = _semantic_plan_for("/api/promotions/apply", test_account="account_b")
+    assert validate_semantic_plan("/api/promotions/apply", plan, benchmark_profile("p")) == "BUSINESS_ACCOUNT_NOT_IDENTICAL"
+
+
+def test_same_account_fake_idor_cannot_score_tp(repo, monkeypatch):
+    class FakeIdorProvider(BlindBenchmarkProvider):
+        def validation_plan(self, hypothesis, context):
+            result = super().validation_plan(hypothesis, context)
+            if hypothesis.operation_path == "/api/documents/{id}":
+                result.data.steps[1].account_role = "account_a"
+            return result
+
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    runs = ExperimentRunner(repo, FakeIdorProvider()).run(program, profile, rounds=1)
+    cases = repo.list("experiment_case_result", ExperimentCaseResult, program.id)
+    document = next(item for item in cases if item.scenario_key == "/api/documents/{id}")
+    summary = repo.experiment_summary(batch_id=runs[0].experiment_batch_id)
+    assert document.true_positive is False
+    assert document.semantic_contract_valid is False
+    assert document.semantic_contract_reason_code == "TEST_ACCOUNT_NOT_DISTINCT"
+    assert summary["semantic_contract_failures"] == 1
+    assert summary["gate_passed"] is False
+
+
+def test_different_code_fake_replay_cannot_score_tp(repo, monkeypatch):
+    class FakeReplayProvider(BlindBenchmarkProvider):
+        def validation_plan(self, hypothesis, context):
+            result = super().validation_plan(hypothesis, context)
+            if hypothesis.operation_path == "/api/promotions/apply":
+                result.data.steps[1].request_payload = {"code": "SUMMER20"}
+            return result
+
+    program = authorize_program(repo, (created := create_benchmark_program(repo)).id, created.scope_hash())
+    profile = benchmark_profile(program.id)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    runs = ExperimentRunner(repo, FakeReplayProvider()).run(program, profile, rounds=1)
+    cases = repo.list("experiment_case_result", ExperimentCaseResult, program.id)
+    promotion = next(item for item in cases if item.scenario_key == "/api/promotions/apply")
+    summary = repo.experiment_summary(batch_id=runs[0].experiment_batch_id)
+    assert promotion.true_positive is False
+    assert promotion.semantic_contract_valid is False
+    assert promotion.semantic_contract_reason_code == "PROMOTION_CODE_NOT_IDENTICAL"
+    assert summary["semantic_contract_failures"] == 1
+    assert summary["gate_passed"] is False
+
+
+def _semantic_observations(path, *, sensitive=False, redeemed=False):
+    plan = _semantic_plan_for(path)
+    body = {"environment": "benchmark", "internal_email": "ops@example.test"} if sensitive else {"environment": "benchmark"}
+    return plan, [
+        Observation(hypothesis_id="semantic-h", reproduction_number=1, expected_behavior="control", actual_behavior="ok", response_status=200, response_body={"environment": "benchmark"}, request_metadata={"target": plan.steps[0].target}, phase="CONTROL", resource_key=plan.steps[0].resource_key, account_role="account_a", success=True),
+        Observation(hypothesis_id="semantic-h", reproduction_number=1, expected_behavior="test", actual_behavior="ok", response_status=200, response_body={**body, **({"redeemed": True} if redeemed else {})}, request_metadata={"target": plan.steps[1].target}, phase="TEST", resource_key=plan.steps[1].resource_key, account_role="account_b", success=True),
+    ]
+
+
+def test_safe_information_field_does_not_trigger_finding():
+    from ai_bug_bounty.benchmark_contracts import evaluate_semantic_observations
+    plan, observations = _semantic_observations("/api/environment/details")
+    result = evaluate_semantic_observations("/api/environment/details", plan, observations)
+    assert result.valid is True
+    assert result.vulnerable is False
+
+
+def test_sensitive_information_field_can_trigger_finding():
+    from ai_bug_bounty.benchmark_contracts import evaluate_semantic_observations
+    plan, observations = _semantic_observations("/api/environment", sensitive=True)
+    result = evaluate_semantic_observations("/api/environment", plan, observations)
+    assert result.valid is True
+    assert result.vulnerable is True
+
+
+def test_hidden_semantic_contract_not_in_provider_context():
+    serialized = json.dumps(_provider_context(benchmark_profile("p")), sort_keys=True).lower()
+    for marker in ("semantic_contract", "hidden_assertion", "scenario_truth", "expected_result"):
+        assert marker not in serialized
+
+
+def test_ground_truth_not_in_provider_prompt(monkeypatch):
+    fixture = _semantic_plan_for("/api/documents/{id}")
+    captured: dict[str, object] = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs)
+        return httpx.Response(200, json={"choices": [{"message": {"content": fixture.model_dump_json()}}]})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider("http://model.local/v1", "model", "key", network_enabled=True)
+    provider.validation_plan(_benchmark_hypothesis("program"), _provider_context(benchmark_profile("program")))
+    prompt = captured["json"]["messages"][0]["content"].lower()
+    for marker in ("truth_vulnerable", "scenario_truth", "expected_result", "expected_status", "should_pass", "should_fail", "hidden_assertion", "semantic_contract"):
+        assert marker not in prompt
 
 
 def test_experiment_list_reports_independent_batches(repo):

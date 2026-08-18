@@ -8,6 +8,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from .benchmark_contracts import BatchIntegrityValidator
 from .domain import (
     AuditEvent,
     CostEntry,
@@ -277,23 +278,33 @@ class Repository:
             batches = self.experiment_list(program_id)
             if len(batches) > 1:
                 raise ValueError("Multiple experiment batches exist; specify batch_id")
-            selected_batch = batches[0] if batches else None
-
-        all_runs = self.list("experiment_run", ExperimentRun, program_id)
+        all_runs = self.list("experiment_run", ExperimentRun)
+        all_cases = self.list("experiment_case_result", ExperimentCaseResult)
         if selected_batch:
             run_ids = set(selected_batch.run_ids)
-            runs = [item for item in all_runs if item.experiment_batch_id == selected_batch.id or item.id in run_ids]
+            runs = [item for item in all_runs if item.id in run_ids and item.program_id == selected_batch.program_id]
             cases = [
-                item for item in self.list("experiment_case_result", ExperimentCaseResult, program_id)
-                if item.experiment_batch_id == selected_batch.id or item.experiment_run_id in run_ids
+                item for item in all_cases
+                if item.experiment_batch_id == selected_batch.id
+                and item.experiment_run_id in run_ids
+                and item.program_id == selected_batch.program_id
             ]
+            from .experiments import benchmark_version
+            integrity = BatchIntegrityValidator(
+                selected_batch,
+                all_runs,
+                all_cases,
+                benchmark_version(selected_batch.operation_manifest or None),
+            ).validate()
         else:
-            runs = all_runs
-            cases = self.list("experiment_case_result", ExperimentCaseResult, program_id)
+            runs = [item for item in all_runs if program_id is None or item.program_id == program_id]
+            cases = [item for item in all_cases if program_id is None or item.program_id == program_id]
+            integrity = BatchIntegrityValidator(None, runs, cases).validate()
         tp = sum(item.true_positive for item in cases)
         fp = sum(item.false_positive for item in cases)
         fn = sum(item.false_negative for item in cases)
         contract_failures = sum(not item.contract_valid for item in cases)
+        semantic_contract_failures = sum(not item.semantic_contract_valid for item in cases)
         known_cost = sum(item.known_cost for item in runs)
         unknown_cost_entries = sum(item.unknown_cost_entries for item in runs)
         input_tokens = sum(item.input_tokens for item in runs)
@@ -304,7 +315,7 @@ class Repository:
         for item in cases:
             scenario_runs[item.scenario_key] = scenario_runs.get(item.scenario_key, 0) + 1
             scenario_hits[item.scenario_key] = scenario_hits.get(item.scenario_key, 0) + int(item.true_positive)
-        gate_failures: list[str] = []
+        gate_failures: list[str] = list(integrity.failures)
         if len(runs) < 3 or not cases:
             gate_failures.append("insufficient_rounds")
         if any(item.experiment_batch_id is None for item in runs):
@@ -341,6 +352,7 @@ class Repository:
             "false_positive": fp,
             "false_negative": fn,
             "contract_failures": contract_failures,
+            "semantic_contract_failures": semantic_contract_failures,
             "precision": tp / (tp + fp) if tp + fp else None,
             "recall": tp / (tp + fn) if tp + fn else None,
             "scope_violations": sum(item.scope_violations for item in cases),
@@ -352,7 +364,7 @@ class Repository:
             "unknown_cost_entries": unknown_cost_entries,
             "cost_per_true_candidate": known_cost / valid_candidates if valid_candidates else None,
             "gate_passed": not gate_failures,
-            "gate_failures": gate_failures,
+            "gate_failures": list(dict.fromkeys(gate_failures)),
         }
 
     def audit(self, event_type: str, entity_type: str, entity_id: str, data: dict[str, Any]) -> AuditEvent:

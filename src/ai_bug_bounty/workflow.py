@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from .benchmark_contracts import evaluate_semantic_observations, validate_semantic_plan
 from .cost import record_usage
 from .domain import (
     ActionProposal,
@@ -104,6 +105,9 @@ def validate_benchmark_plan(
         return "MULTI_OPERATION_PLAN"
     if operation_keys != {(hypothesis.operation_method.upper(), hypothesis.operation_path)}:
         return "SCENARIO_MISMATCH"
+    semantic_reason = validate_semantic_plan(hypothesis.operation_path, plan, target_profile)
+    if semantic_reason:
+        return semantic_reason
     return None
 
 
@@ -328,7 +332,7 @@ class ResearchOrchestrator:
                 )
                 self.repository.save("observation", observation, program.id, "OBSERVATION_RECORDED")
                 observations.append(observation)
-            broken, actual, impact = self._evaluate_plan(plan, observations)
+            broken, actual, impact = self._evaluate_plan(plan, observations, hypothesis.operation_path)
             evidence_ids: list[str] = []
             for observation, decision in zip(observations, decisions, strict=True):
                 try:
@@ -410,7 +414,15 @@ class ResearchOrchestrator:
         )
 
     @staticmethod
-    def _evaluate_plan(plan: ValidationPlan, observations: list[Observation]) -> tuple[bool, str, str]:
+    def _evaluate_plan(
+        plan: ValidationPlan, observations: list[Observation], scenario_key: str | None = None
+    ) -> tuple[bool, str, str]:
+        if scenario_key:
+            semantic = evaluate_semantic_observations(scenario_key, plan, observations)
+            test_statuses = ", ".join(str(item.response_status) for item in observations if item.phase == "TEST")
+            actual = f"Control/test observations recorded; test statuses: {test_statuses}."
+            impact = "Unauthorized or invalid state behavior was observed in the local benchmark." if semantic.vulnerable else ""
+            return semantic.vulnerable, actual, impact
         controls = [item for item, step in zip(observations, plan.steps, strict=True) if step.phase == "CONTROL"]
         tests = [item for item, step in zip(observations, plan.steps, strict=True) if step.phase == "TEST"]
         control_ok = all(item.response_status < 400 for item in controls)

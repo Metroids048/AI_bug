@@ -163,8 +163,27 @@ def experiment_summary(
     batch_id: str | None = typer.Option(None, "--batch-id"),
     db: Path = typer.Option(Path("data/bugbounty.sqlite3"), "--db"),
 ) -> None:
+    if batch_id is None:
+        typer.echo(
+            "Unable to load experiment summary: --batch-id is required for Gate evaluation.\n"
+            f"Run `abb experiment-list --program-id {program_id or '<PROGRAM_ID>'} --db {db}` to view available batches, "
+            "then rerun with --batch-id.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     repo = repository(db)
-    typer.echo(json.dumps(repo.experiment_summary(program_id, batch_id=batch_id), indent=2))
+    try:
+        summary = repo.experiment_summary(program_id, batch_id=batch_id)
+    except ValueError as exc:
+        program_hint = program_id or "<PROGRAM_ID>"
+        typer.echo(
+            f"Unable to load experiment summary: {exc}\n"
+            f"Run `abb experiment-list --program-id {program_hint} --db {db}` to view available batches, "
+            "then rerun with --batch-id.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(summary, indent=2))
 
 
 @app.command("experiment-list")

@@ -465,6 +465,7 @@ class ExperimentBatch(StrictModel):
     provider: str
     model: str
     benchmark_version: str
+    operation_manifest: list[dict[str, Any]] = Field(default_factory=list)
     requested_rounds: int = Field(ge=1)
     run_ids: list[str] = Field(default_factory=list)
     status: ExperimentBatchStatus = ExperimentBatchStatus.RUNNING
@@ -485,6 +486,8 @@ class ExperimentCaseResult(StrictModel):
     declared_operation_path: str | None = None
     contract_valid: bool = True
     contract_reason_code: str | None = None
+    semantic_contract_valid: bool = True
+    semantic_contract_reason_code: str | None = None
     executed_methods: list[str] = Field(default_factory=list)
     executed_targets: list[str] = Field(default_factory=list)
     finding_id: str | None = None

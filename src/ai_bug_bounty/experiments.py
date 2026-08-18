@@ -6,6 +6,15 @@ import random
 from datetime import UTC, datetime
 from typing import Any
 
+from .benchmark_contracts import (
+    BENCHMARK_CONTRACT_VERSION,
+    FIXTURE_VERSION,
+    PUBLIC_OPERATION_MANIFEST,
+    SCENARIO_CLASS,
+    SCENARIO_TRUTH,
+    SEMANTIC_ASSERTION_VERSION,
+    is_semantic_failure,
+)
 from .domain import (
     Evidence,
     ExperimentBatch,
@@ -26,37 +35,10 @@ from .providers import Provider
 from .storage import Repository
 from .workflow import PlanContractViolation, Planner, ResearchOrchestrator, validate_benchmark_plan
 
-# Ground truth is deliberately isolated to this metric/fixture boundary and is
-# never included in the provider context.
-SCENARIO_TRUTH: dict[str, bool] = {
-    "/api/documents/{id}": True,
-    "/api/items/{id}": False,
-    "/api/environment": True,
-    "/api/environment/details": False,
-    "/api/promotions/apply": True,
-    "/api/promotions/submit": False,
-    "/api/users/{id}": False,
-    "/api/records/{id}": False,
-    "/api/metadata/{id}": False,
-}
-
-SCENARIO_CLASS: dict[str, str] = {
-    "/api/documents/{id}": "idor",
-    "/api/items/{id}": "idor",
-    "/api/environment": "information",
-    "/api/environment/details": "information",
-    "/api/promotions/apply": "business",
-    "/api/promotions/submit": "business",
-    "/api/users/{id}": "deceptive_profile",
-    "/api/records/{id}": "deceptive_record",
-    "/api/metadata/{id}": "deceptive_metadata",
-}
-
-BENCHMARK_CONTRACT_VERSION = "M2.6.3-benchmark-contract-v1"
-
 
 def benchmark_version(operations: list[dict[str, Any]] | None = None) -> str:
     """Return a stable version for the benchmark contract, independent of provider context."""
+    operations = operations or list(PUBLIC_OPERATION_MANIFEST)
     normalized = [
         {
             "method": str(item.get("method", "")).upper(),
@@ -67,6 +49,9 @@ def benchmark_version(operations: list[dict[str, Any]] | None = None) -> str:
     ]
     payload = {
         "contract": BENCHMARK_CONTRACT_VERSION,
+        "semantic_assertion": SEMANTIC_ASSERTION_VERSION,
+        "fixture": FIXTURE_VERSION,
+        "scenario_manifest": sorted(SCENARIO_TRUTH),
         "operations": sorted(normalized, key=lambda item: (item["path"], item["method"])),
         "scenario_truth": SCENARIO_TRUTH,
         "scenario_class": SCENARIO_CLASS,
@@ -95,6 +80,10 @@ class ExperimentRunner:
             provider=self.provider.name,
             model=self.provider.model,
             benchmark_version=benchmark_version(operations),
+            operation_manifest=[
+                {key: operation[key] for key in ("path", "method", "description") if key in operation}
+                for operation in operations
+            ],
             requested_rounds=rounds,
         )
         self.repository.save("experiment_batch", batch, program.id, "EXPERIMENT_BATCH_STARTED")
@@ -186,7 +175,10 @@ class ExperimentRunner:
         plan = self.repository.get("validation_plan", hypothesis.validation_plan_id or "", ValidationPlan)
         contract_reason = validate_benchmark_plan(hypothesis, plan, profile) if plan else "VALIDATION_PLAN_HYPOTHESIS_MISMATCH"
         if contract_reason:
-            return self._contract_case(run, path, truth, declared_method, declared_path, contract_reason)
+            return self._contract_case(
+                run, path, truth, declared_method, declared_path, contract_reason,
+                semantic_failure=is_semantic_failure(contract_reason),
+            )
         try:
             finding = ResearchOrchestrator(
                 self.repository, self.provider, self.executor, experiment_run_id=run.id
@@ -237,6 +229,7 @@ class ExperimentRunner:
         declared_method: str | None,
         declared_path: str | None,
         reason_code: str,
+        semantic_failure: bool = False,
     ) -> ExperimentCaseResult:
         return ExperimentCaseResult(
             experiment_run_id=run.id,
@@ -249,6 +242,8 @@ class ExperimentRunner:
             declared_operation_path=declared_path,
             contract_valid=False,
             contract_reason_code=reason_code,
+            semantic_contract_valid=not semantic_failure,
+            semantic_contract_reason_code=reason_code if semantic_failure else None,
             false_negative=truth,
         )
 

@@ -306,9 +306,12 @@ class OpenAICompatibleProvider(Provider):
             raise ProviderDisabled("Model network is disabled; enable it explicitly for a smoke test.")
         if not self.api_key:
             raise ProviderDisabled("Model API key is missing; set ABB_LLM_API_KEY explicitly.")
-        schema_json = json.dumps(schema.model_json_schema(), sort_keys=True)
+        schema_definition = schema.model_json_schema()
+        if task == "validator-planner" and context.get("hypothesis", {}).get("asset") == "lab://benchmark":
+            schema_definition = _without_benchmark_oracle_fields(schema_definition)
+        schema_json = json.dumps(schema_definition, sort_keys=True)
         prompt = self._prompt(task, context, schema_json)
-        _, content, usage = self._request(prompt, schema)
+        _, content, usage = self._request(prompt, schema, schema_definition)
         try:
             result = schema.model_validate_json(content)
         except Exception as first_error:
@@ -319,7 +322,7 @@ class OpenAICompatibleProvider(Provider):
                 repair=f"The previous JSON failed schema validation: {str(first_error)[:1000]}",
                 previous_response=content,
             )
-            _, repair_content, repair_usage = self._request(repair_prompt, schema)
+            _, repair_content, repair_usage = self._request(repair_prompt, schema, schema_definition)
             usage = _merge_usage(usage, repair_usage)
             try:
                 result = schema.model_validate_json(repair_content)
@@ -350,7 +353,9 @@ class OpenAICompatibleProvider(Provider):
             lines.extend([repair, f"Previous response to repair: {previous_response or ''}"])
         return "\n".join(lines)
 
-    def _request(self, prompt: str, schema: type[T]) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    def _request(
+        self, prompt: str, schema: type[T], schema_definition: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
         request_json: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
@@ -359,7 +364,7 @@ class OpenAICompatibleProvider(Provider):
         if os.getenv("ABB_LLM_STRUCTURED_OUTPUT", "false").lower() == "true":
             request_json["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": schema.__name__, "strict": True, "schema": schema.model_json_schema()},
+                "json_schema": {"name": schema.__name__, "strict": True, "schema": schema_definition or schema.model_json_schema()},
             }
         response = httpx.post(
             f"{self.base_url}/chat/completions",
@@ -439,6 +444,20 @@ def _merge_usage(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any
         left, right = first.get(key), second.get(key)
         merged[key] = left + right if isinstance(left, int) and isinstance(right, int) else None
     return merged
+
+
+def _without_benchmark_oracle_fields(value: Any) -> Any:
+    """Keep answer schemas useful without exposing expected status fields to a model."""
+    if isinstance(value, dict):
+        result = {key: _without_benchmark_oracle_fields(item) for key, item in value.items()}
+        if isinstance(result.get("properties"), dict):
+            result["properties"].pop("expected_status", None)
+        if isinstance(result.get("required"), list):
+            result["required"] = [item for item in result["required"] if item != "expected_status"]
+        return result
+    if isinstance(value, list):
+        return [_without_benchmark_oracle_fields(item) for item in value]
+    return value
 
 
 def _benchmark_target_path(path: str) -> str:
