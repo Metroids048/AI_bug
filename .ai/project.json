@@ -1,0 +1,5 @@
+{
+  "project_id": "ai-bug",
+  "memory_pack": ["ai-bug"],
+  "skill_profiles": ["engineering", "security", "research"]
+}
